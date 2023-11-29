@@ -1,0 +1,154 @@
+#!/bin/sh
+
+
+rules=config.rules
+usage=no
+debug=no
+
+default_cc=gcc
+default_ld=gcc
+default_ar=ar
+
+cflags_d="-O0 -g -DDEBUG"
+cflags_r="-O3"
+
+ldflags_d="-L-g"
+ldflags_r="-L-s"
+
+
+
+help()
+{
+
+	echo
+	echo "Use $0 [options]"
+	echo
+	echo "\t--help            Show help"
+	echo
+	echo "\t--release         Release build (default)"
+	echo "\t--debug           Debug build"
+	echo
+
+}
+
+
+
+parse()
+{
+
+	for arg in "$@"
+	do
+		case "${arg}" in
+
+			--help)    usage=yes;;
+			--debug)   debug=yes;;
+			--release) debug=no;;
+
+			*)
+				usage=yes
+				echo "Unknown option: ${arg}"
+				;;
+
+		esac
+	done
+
+}
+
+
+
+report()
+{
+
+	echo
+	echo "CC:          ${CC}"
+	echo "LD:          ${LD}"
+	echo "AR:          ${AR}"
+	echo
+	echo "CFLAGS:      ${CFLAGS}"
+	echo "LDLAGS:      ${LDFLAGS}"
+	echo
+	echo "Debug:       ${debug}"
+	echo
+
+}
+
+
+
+check_header()
+{
+
+	echo "#include <$1>" | ${CC} -E ${CFLAGS} - >/dev/null 2>&1
+
+}
+
+
+
+configure_compiler()
+{
+
+	if [ "x${CC}" = "x" ]
+	then
+		CC=$(which ${default_cc})
+	fi
+
+	if [ "x${LD}" = "x" ]
+	then
+		LD=$(which ${default_ld})
+	fi
+
+	if [ "x${AR}" = "x" ]
+	then
+		AR=$(which ${default_ar})
+	fi
+
+	echo
+	echo "#"
+	echo "# Compiler"
+	echo "#"
+	echo "cc      = ${CC}"
+	echo "ld      = ${LD}"
+	echo "ar      = ${AR}"
+	echo "cflags  = ${CFLAGS}"
+	echo "ldflags = ${LDFLAGS}"
+	echo
+
+}
+
+
+
+configure_debug()
+{
+
+	echo
+	echo "#"
+	echo "# Debug: ${debug}"
+	echo "#"
+
+	if [ "x${debug}" = "xyes" ]
+	then
+		echo "cflags  += ${cflags_d}"
+		echo "ldflags += ${ldflags_d}"
+	else
+		echo "cflags  += ${cflags_r}"
+		echo "ldflags += ${ldflags_r}"
+	fi
+
+	echo
+
+}
+
+
+
+parse "$@"
+
+if [ "x${usage}" = "xyes" ]
+then
+	help
+	exit 0
+fi
+
+configure_compiler >  ${rules}
+configure_debug    >> ${rules}
+
+report
+
