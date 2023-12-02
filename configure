@@ -4,6 +4,7 @@
 rules=config.rules
 usage=no
 debug=no
+zlib=auto
 
 default_cc=gcc
 default_ld=gcc
@@ -23,10 +24,12 @@ help()
 	echo
 	echo "Use $0 [options]"
 	echo
-	echo "\t--help            Show help"
+	echo "\t--help                 Show help"
 	echo
-	echo "\t--release         Release build (default)"
-	echo "\t--debug           Debug build"
+	echo "\t--release              Release build (default)"
+	echo "\t--debug                Debug build"
+	echo
+	echo "\t--zlib=yes|no|auto     Enable, disable or detect zlib  (auto)"
 	echo
 
 }
@@ -43,6 +46,10 @@ parse()
 			--help)    usage=yes;;
 			--debug)   debug=yes;;
 			--release) debug=no;;
+
+			--zlib=*)
+				zlib=${arg#--zlib=*}
+				;;
 
 			*)
 				usage=yes
@@ -68,6 +75,8 @@ report()
 	echo "LDLAGS:      ${LDFLAGS}"
 	echo
 	echo "Debug:       ${debug}"
+	echo
+	echo "zlib:        ${zlib}"
 	echo
 
 }
@@ -139,6 +148,33 @@ configure_debug()
 
 
 
+configure_zlib()
+{
+
+	echo
+	echo "#"
+	echo "# Z-Lib"
+	echo "#"
+
+	if [ "x$zlib" = "xno" ]
+	then
+		return
+	fi
+
+	if [ "x$zlib" = "xyes" ] || check_header "zlib.h"
+	then
+		echo "cflags  += -DHAVE_ZLIB"
+		echo "ldflags += -lz"
+		echo
+		zlib=yes
+	else
+		zlib=no
+	fi
+
+}
+
+
+
 parse "$@"
 
 if [ "x${usage}" = "xyes" ]
@@ -149,6 +185,7 @@ fi
 
 configure_compiler >  ${rules}
 configure_debug    >> ${rules}
+configure_zlib     >> ${rules}
 
 report
 
