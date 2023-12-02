@@ -5,6 +5,7 @@ rules=config.rules
 usage=no
 debug=no
 zlib=auto
+zydis=auto
 
 default_cc=gcc
 default_ld=gcc
@@ -30,6 +31,7 @@ help()
 	echo "\t--debug                Debug build"
 	echo
 	echo "\t--zlib=yes|no|auto     Enable, disable or detect zlib  (auto)"
+	echo "\t--zydis=yes|no|auto    Enable, disable or detect zydis (auto)"
 	echo
 
 }
@@ -49,6 +51,10 @@ parse()
 
 			--zlib=*)
 				zlib=${arg#--zlib=*}
+				;;
+
+			--zydis=*)
+				zydis=${arg#--zydis=*}
 				;;
 
 			*)
@@ -77,6 +83,7 @@ report()
 	echo "Debug:       ${debug}"
 	echo
 	echo "zlib:        ${zlib}"
+	echo "zydis:       ${zydis}"
 	echo
 
 }
@@ -175,6 +182,33 @@ configure_zlib()
 
 
 
+configure_zydis()
+{
+
+	echo
+	echo "#"
+	echo "# zydis"
+	echo "#"
+
+	if [ "x$zydis" = "xno" ]
+	then
+		return
+	fi
+
+	if check_header "Zydis/Zydis.h"
+	then
+		echo "cflags  += -DHAVE_ZYDIS"
+		echo "ldflags += -lZydis"
+		echo
+		zydis=yes
+	else
+		zydis=no
+	fi
+
+}
+
+
+
 parse "$@"
 
 if [ "x${usage}" = "xyes" ]
@@ -186,6 +220,7 @@ fi
 configure_compiler >  ${rules}
 configure_debug    >> ${rules}
 configure_zlib     >> ${rules}
+configure_zydis    >> ${rules}
 
 report
 
