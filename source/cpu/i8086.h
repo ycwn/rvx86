@@ -29,12 +29,12 @@ struct i8086 {
 	// CPU register state
 	struct {
 
-		u16 cs, scs;
+		u16 scs;
 		u16 ip, sip;
-		u16 ds, es, ss;
+		u16 es, cs, ss, ds;
 
-		i8086_reg ax, bx, cx, dx;
-		i8086_reg bp, sp, si, di;
+		i8086_reg ax, cx, dx, bx;
+		i8086_reg sp, bp, si, di;
 
 	} regs;
 
@@ -94,7 +94,6 @@ struct i8086 {
 		bool complete:       1;
 
 		bool op_wide:     1;
-		bool op_reverse:  1;
 		bool op_rseg:     1;
 		bool op_group:    1;
 		bool op_override: 1;
@@ -131,9 +130,7 @@ extern void i8086_undef(struct i8086 *cpu);
 
 
 static inline struct wire i8086_irq(struct i8086 *cpu) {
-	struct wire w = {
-		.fn=(wire_fn*)&i8086_intrq, .data=cpu, .id=0
-	};
+	struct wire w = MKWIRE(&i8086_intrq, cpu, 0);
 	return w;
 }
 
