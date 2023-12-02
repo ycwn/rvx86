@@ -3,7 +3,8 @@
 subsystems = \
 	core cpu device hal util
 
-targets =
+targets = \
+	test
 
 ifneq ("$(wildcard config.rules)","")
 include config.rules
@@ -23,7 +24,7 @@ prgs = $(targets:%=$(build)/%.o)
 deps = $(objs:%.o=%.d) $(prgs:%.o=%.d)
 
 
-.PHONY: all build clean purge $(targets)
+.PHONY: all build clean purge $(targets) tests
 .PHONY: .FORCE
 .FORCE:
 
@@ -40,6 +41,8 @@ clean:
 purge: clean
 	rm -f $(config.rules)
 
+tests: build $(build)/test
+	$(build)/test data/tests/opcode-*.dat.gz
 
 -include $(deps)
 
