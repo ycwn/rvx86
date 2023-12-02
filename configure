@@ -11,7 +11,7 @@ default_ld=gcc
 default_ar=ar
 
 cflags_d="-O0 -g -DDEBUG"
-cflags_r="-O3"
+cflags_r="-O3 -ffast-math -ftree-vectorize"
 
 ldflags_d="-L-g"
 ldflags_r="-L-s"
