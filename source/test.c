@@ -10,7 +10,8 @@
 
 #include "core/types.h"
 #include "core/debug.h"
-#include "core/bus.h"
+#include "core/io.h"
+#include "core/memory.h"
 #include "core/wire.h"
 
 #include "cpu/i8086.h"
@@ -142,7 +143,7 @@ void test_complete(struct test_report *tr)
 
 
 
-void i8086_undef(struct i8086 *cpu)
+void test_undef(struct i8086 *cpu)
 {
 
 	test_undefined = true;
@@ -235,7 +236,8 @@ bool test_run_cases(struct test_report *tr, struct i8086 *cpu, const char *path)
 
 			if (executed) {
 
-				test_expect(tr, "FLAGS",       cpu->flags.w & undef, flags & undef);
+				test_expect(tr, "FLAGS", i8086_reg_get(cpu, REG_FLAGS) & undef, flags & undef);
+
 				test_expect(tr, "Register AX", cpu->regs.ax.w, ax);
 				test_expect(tr, "Register BX", cpu->regs.bx.w, bx);
 				test_expect(tr, "Register CX", cpu->regs.cx.w, cx);
@@ -245,14 +247,16 @@ bool test_run_cases(struct test_report *tr, struct i8086 *cpu, const char *path)
 				test_expect(tr, "Register BP", cpu->regs.bp.w, bp);
 				test_expect(tr, "Register SP", cpu->regs.sp.w, sp);
 				test_expect(tr, "Register IP", cpu->regs.ip,   ip);
-				test_expect(tr, "Register CS", cpu->regs.cs,   cs);
-				test_expect(tr, "Register DS", cpu->regs.ds,   ds);
-				test_expect(tr, "Register ES", cpu->regs.es,   es);
-				test_expect(tr, "Register SS", cpu->regs.ss,   ss);
+
+				test_expect(tr, "Register CS", i8086_reg_get(cpu, REG_CS), cs);
+				test_expect(tr, "Register DS", i8086_reg_get(cpu, REG_DS), ds);
+				test_expect(tr, "Register ES", i8086_reg_get(cpu, REG_ES), es);
+				test_expect(tr, "Register SS", i8086_reg_get(cpu, REG_SS), ss);
 
 			} else {
 
-				cpu->flags.w   = flags;
+				i8086_reg_set(cpu, REG_FLAGS, flags);
+
 				cpu->regs.ax.w = ax;
 				cpu->regs.bx.w = bx;
 				cpu->regs.cx.w = cx;
@@ -262,10 +266,12 @@ bool test_run_cases(struct test_report *tr, struct i8086 *cpu, const char *path)
 				cpu->regs.bp.w = bp;
 				cpu->regs.sp.w = sp;
 				cpu->regs.ip   = ip;
-				cpu->regs.cs   = cs;
-				cpu->regs.ds   = ds;
-				cpu->regs.es   = es;
-				cpu->regs.ss   = ss;
+
+				i8086_reg_set(cpu, REG_CS, cs);
+				i8086_reg_set(cpu, REG_DS, ds);
+				i8086_reg_set(cpu, REG_ES, es);
+				i8086_reg_set(cpu, REG_SS, ss);
+
 				cpu->regs.scs  = cs;
 				cpu->regs.sip  = ip;
 
@@ -279,10 +285,18 @@ bool test_run_cases(struct test_report *tr, struct i8086 *cpu, const char *path)
 			u32 addr = strtoul(&line[1], &pval, 0);
 			uint val = strtoul(pval, NULL, 0);
 
-			*pval = 0;
+			if (executed) {
 
-			if (executed) test_expect(tr, line, ram_peek(cpu->mem.data, addr), val);
-			else          ram_poke(cpu->mem.data, addr, val);
+				uint stack = (i8086_reg_get(cpu, REG_SS) * 16 + cpu->regs.sp.w) & cpu->memory.mem.mask;
+
+				// DIVERR pushes undefined flags to stack, so ignore them
+				if (stack - addr == -4 || stack - addr == -5)
+					continue;
+
+				test_expect(tr, line, cpu->memory.mem.base[addr], val);
+
+			} else
+				cpu->memory.mem.base[addr] = val;
 
 
 		} else if (line[0] == 'X') {
@@ -291,7 +305,7 @@ bool test_run_cases(struct test_report *tr, struct i8086 *cpu, const char *path)
 
 				i8086_tick(cpu);
 
-				if (cpu->insn.fetch_opcode && !cpu->insn.op_override)
+				if (cpu->insn.fetch && !cpu->insn.op_override)
 					break;
 			}
 
@@ -346,18 +360,20 @@ void ioport_rdwr(void *data, u16 port, uint mode, uint *v)
 int main(int argc, char **argv)
 {
 
-	struct ram   ram;
-	struct i8086 cpu;
+	RAM ram;
+	i8086 cpu;
 
 	ram_alloc(&ram, 1*1024*1024);
 	i8086_init(&cpu);
 
-	cpu.io.rd = &ioport_rdwr;
-	cpu.io.wr = &ioport_rdwr;
+	cpu.memory.mem = ram;
+	cpu.iob = io_make(NULL, &ioport_rdwr, ioport_rdwr);
+	cpu.iow = io_make(NULL, &ioport_rdwr, ioport_rdwr);
 
-	cpu.mem.data = &ram;
-	cpu.mem.rd   = &ram_rd;
-	cpu.mem.wr   = &ram_wr;
+	cpu.undef = &test_undef;
+
+	memory_a20gate(&cpu.memory.mem, false); // A20 gate disable
+
 
 	struct test_report tr[argc];
 
