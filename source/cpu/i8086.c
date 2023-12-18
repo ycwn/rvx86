@@ -8,130 +8,245 @@
 
 #include "core/types.h"
 #include "core/debug.h"
-#include "core/bus.h"
+#include "core/io.h"
+#include "core/memory.h"
 #include "core/wire.h"
+
 
 #include "cpu/i8086.h"
 
 
-
-#define CPU  struct i8086 *cpu
-
-
-typedef u32 aluu;
-typedef i32 alui;
+typedef u32 ureg;
+typedef i32 ireg;
 
 
-#define INCIPB()  do { cpu->regs.ip++;    } while (0)
-#define INCIPW()  do { cpu->regs.ip += 2; } while (0)
+enum {
+
+	OP_MODRM = 1 << 8,  // Requires MODRM
+	OP_W8    = 0 << 9,  // Is 8-bit operation
+	OP_W16   = 1 << 9,  // Is 16-bit operation
+	OP_RSEG  = 1 << 10, // REG in MODRM is segment register
+	OP_GROUP = 1 << 11, // Group opcode, REG field of MODRM is operation
+	OP_OVRD  = 1 << 12, // Opcode is override, keep flags
+	OP_R02   = 1 << 13, // Lowest 3 bits of opcode is register
+
+	OP_RMB  = OP_MODRM | OP_W8,
+	OP_RMW  = OP_MODRM | OP_W16,
+	OP_R02B = OP_R02   | OP_W8,
+	OP_R02W = OP_R02   | OP_W16,
+	OP_SEGW = OP_MODRM | OP_W16 | OP_RSEG,
+
+	OP_G0  =  0 | OP_RMB | OP_GROUP,
+	OP_G1  =  1 | OP_RMW | OP_GROUP,
+	OP_G2  =  2 | OP_RMB | OP_GROUP,
+	OP_G3  =  3 | OP_RMW | OP_GROUP,
+	OP_G4  =  4 | OP_RMB | OP_GROUP,
+	OP_G5  =  5 | OP_RMW | OP_GROUP,
+	OP_G6  =  6 | OP_RMB | OP_GROUP,
+	OP_G7  =  7 | OP_RMW | OP_GROUP,
+	OP_G8  =  8 | OP_RMB | OP_GROUP,
+	OP_G9  =  9 | OP_RMW | OP_GROUP,
+	OP_G10 = 10 | OP_RMB | OP_GROUP,
+	OP_G11 = 11 | OP_RMW | OP_GROUP,
+
+
+	OP_MODRM_REG_AX_AL = 0 << 0,
+	OP_MODRM_REG_BX_BL = 1 << 0,
+	OP_MODRM_REG_CX_CL = 2 << 0,
+	OP_MODRM_REG_DX_DL = 3 << 0,
+	OP_MODRM_REG_SI_DH = 4 << 0,
+	OP_MODRM_REG_DI_BH = 5 << 0,
+	OP_MODRM_REG_SP_AH = 6 << 0,
+	OP_MODRM_REG_BP_CH = 7 << 0,
+
+	OP_MODRM_REG_CS = 0 << 3,
+	OP_MODRM_REG_DS = 1 << 3,
+	OP_MODRM_REG_ES = 2 << 3,
+	OP_MODRM_REG_SS = 3 << 3,
+
+	OP_MODRM_REG_GENERIC = 7 << 0,
+	OP_MODRM_REG_SEGMENT = 3 << 3,
+
+	OP_MODRM_REGISTER = 0 << 5,
+	OP_MODRM_MEMORY   = 1 << 5,
+
+	OP_MODRM_SEG_DS = 0 << 6,
+	OP_MODRM_SEG_SS = 1 << 6,
+
+	OP_MODRM_EA_R0      = 7 << 7,
+	OP_MODRM_EA_R0_NONE = 0 << 7,
+	OP_MODRM_EA_R0_BX   = 1 << 7,
+	OP_MODRM_EA_R0_BP   = 2 << 7,
+	OP_MODRM_EA_R0_SI   = 3 << 7,
+	OP_MODRM_EA_R0_DI   = 4 << 7,
+
+	OP_MODRM_EA_R1      = 7 << 10,
+	OP_MODRM_EA_R1_NONE = 0 << 10,
+	OP_MODRM_EA_R1_BX   = 1 << 10,
+	OP_MODRM_EA_R1_BP   = 2 << 10,
+	OP_MODRM_EA_R1_SI   = 3 << 10,
+	OP_MODRM_EA_R1_DI   = 4 << 10,
+
+	OP_MODRM_EA_DISP8  = 1 << 13,
+	OP_MODRM_EA_DISP16 = 1 << 14
+
+};
+
+
+#define CPU  i8086 *cpu
+
+#define SEGMENT(s)  (cpu->memory.selector[(s)])
+
+#define UNDEF(x)   do { if (!(x)) return op_undef(cpu); } while (0)
+#define REGONLY()  UNDEF(!cpu->insn.op_memory)
+#define MEMONLY()  UNDEF(cpu->insn.op_memory)
 
 #define ADVSP(x)  do { cpu->regs.sp.w += (x); } while (0)
 
-#define ADVSIB()  do { if (cpu->flags.d) cpu->regs.si.w++;    else cpu->regs.si.w--;    } while (0)
-#define ADVDIB()  do { if (cpu->flags.d) cpu->regs.di.w++;    else cpu->regs.di.w--;    } while (0)
-#define ADVSIW()  do { if (cpu->flags.d) cpu->regs.si.w += 2; else cpu->regs.si.w -= 2; } while (0)
-#define ADVDIW()  do { if (cpu->flags.d) cpu->regs.di.w += 2; else cpu->regs.di.w -= 2; } while (0)
+#define ADVSIB()  do { cpu->regs.si.w += (cpu->flags.d)? -1: +1; } while (0)
+#define ADVDIB()  do { cpu->regs.di.w += (cpu->flags.d)? -1: +1; } while (0)
+#define ADVSIW()  do { cpu->regs.si.w += (cpu->flags.d)? -2: +2; } while (0)
+#define ADVDIW()  do { cpu->regs.di.w += (cpu->flags.d)? -2: +2; } while (0)
 
-#define LDIPUB()       bus_read8( &cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPB()
-#define LDIPIB()   (i8)bus_read8( &cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPB()
-#define LDIPUW()       bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPW()
-#define LDIPIW()  (i16)bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPW()
+#define LOCKR0MB()  u8  *ptr = ((cpu->insn.op_memory)? (u8*) memlock(cpu, cpu->insn.segment, cpu->insn.addr, 1): cpu->insn.reg0b)
+#define LOCKR1MB()  u8  *ptr = ((cpu->insn.op_memory)? (u8*) memlock(cpu, cpu->insn.segment, cpu->insn.addr, 1): cpu->insn.reg1b)
+#define LOCKR0MW()  u16 *ptr = ((cpu->insn.op_memory)? (u16*)memlock(cpu, cpu->insn.segment, cpu->insn.addr, 2): cpu->insn.reg0w)
+#define LOCKR1MW()  u16 *ptr = ((cpu->insn.op_memory)? (u16*)memlock(cpu, cpu->insn.segment, cpu->insn.addr, 2): cpu->insn.reg1w)
 
-#define LDEAR0MB()  ((cpu->insn.op_memory)? bus_read8( &cpu->mem, cpu->insn.addr): *cpu->insn.reg0b)
-#define LDEAR1MB()  ((cpu->insn.op_memory)? bus_read8( &cpu->mem, cpu->insn.addr): *cpu->insn.reg1b)
-#define LDEAR0MW()  ((cpu->insn.op_memory)? bus_read16(&cpu->mem, cpu->insn.addr): *cpu->insn.reg0w)
-#define LDEAR1MW()  ((cpu->insn.op_memory)? bus_read16(&cpu->mem, cpu->insn.addr): *cpu->insn.reg1w)
+#define LDLCKM()   (*ptr)
+#define STLCKM(x)  do { *ptr = (x); } while (0)
 
-#define LDSU0B()  do { cpu->insn.imm0 =      bus_read8( &cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPB(); } while (0)
-#define LDSU1B()  do { cpu->insn.imm1 =      bus_read8( &cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPB(); } while (0)
-#define LDSI0B()  do { cpu->insn.imm0 =  (i8)bus_read8( &cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPB(); } while (0)
-#define LDSI1B()  do { cpu->insn.imm1 =  (i8)bus_read8( &cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPB(); } while (0)
-#define LDSU0W()  do { cpu->insn.imm0 =      bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPW(); } while (0)
-#define LDSU1W()  do { cpu->insn.imm1 =      bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPW(); } while (0)
-#define LDSI0W()  do { cpu->insn.imm0 = (i16)bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPW(); } while (0)
-#define LDSI1W()  do { cpu->insn.imm1 = (i16)bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip); INCIPW(); } while (0)
+#define LDMB(seg, ofs)  (*(u8*) memlock(cpu, (seg), (ofs), 1))
+#define LDMW(seg, ofs)  (*(u16*)memlock(cpu, (seg), (ofs), 2))
 
-#define LDSPB(n)  bus_read8( &cpu->mem, cpu->regs.ss * 16 + cpu->regs.sp.w + (n))
-#define LDSPW(n)  bus_read16(&cpu->mem, cpu->regs.ss * 16 + cpu->regs.sp.w + (n))
+#define STMB(seg, ofs, v)  do { *(u8*) memlock(cpu, (seg), ofs, 1) = (v); } while (0)
+#define STMW(seg, ofs, v)  do { *(u16*)memlock(cpu, (seg), ofs, 2) = (v); } while (0)
 
-#define STSPB(n, x)  do { bus_write8( &cpu->mem, cpu->regs.ss * 16 + cpu->regs.sp.w + (n), (x)); } while (0)
-#define STSPW(n, x)  do { bus_write16(&cpu->mem, cpu->regs.ss * 16 + cpu->regs.sp.w + (n), (x)); } while (0)
+#define LDIPUB()  (cpu->regs.ip += 1, LDMB(REG_CS, cpu->regs.ip - 1))
+#define LDIPUW()  (cpu->regs.ip += 2, LDMW(REG_CS, cpu->regs.ip - 2))
+#define LDIPSB()   (i8)LDIPUB()
+#define LDIPSW()  (i16)LDIPUW()
 
-#define STEAR0MB(x) do { if (cpu->insn.op_memory) bus_write8( &cpu->mem, cpu->insn.addr, (x)); else *cpu->insn.reg0b = (x); } while (0)
-#define STEAR1MB(x) do { if (cpu->insn.op_memory) bus_write8( &cpu->mem, cpu->insn.addr, (x)); else *cpu->insn.reg1b = (x); } while (0)
-#define STEAR0MW(x) do { if (cpu->insn.op_memory) bus_write16(&cpu->mem, cpu->insn.addr, (x)); else *cpu->insn.reg0w = (x); } while (0)
-#define STEAR1MW(x) do { if (cpu->insn.op_memory) bus_write16(&cpu->mem, cpu->insn.addr, (x)); else *cpu->insn.reg1w = (x); } while (0)
+#define LDEAMB(x)     (LDMB(cpu->insn.segment, cpu->insn.addr + (x)))
+#define LDEAMW(x)     (LDMW(cpu->insn.segment, cpu->insn.addr + (x)))
+#define STEAMB(x, v)  do { STMB(cpu->insn.segment, cpu->insn.addr + (x), (v)); } while (0)
+#define STEAMW(x, v)  do { STMW(cpu->insn.segment, cpu->insn.addr + (x), (v)); } while (0)
+
+#define LDEAR0MB()  ((cpu->insn.op_memory)? LDEAMB(0): *cpu->insn.reg0b)
+#define LDEAR1MB()  ((cpu->insn.op_memory)? LDEAMB(0): *cpu->insn.reg1b)
+#define LDEAR0MW()  ((cpu->insn.op_memory)? LDEAMW(0): *cpu->insn.reg0w)
+#define LDEAR1MW()  ((cpu->insn.op_memory)? LDEAMW(0): *cpu->insn.reg1w)
+
+#define STEAR0MB(x)  do { if (cpu->insn.op_memory) STEAMB(0, (x)); else *cpu->insn.reg0b = (x); } while (0)
+#define STEAR1MB(x)  do { if (cpu->insn.op_memory) STEAMB(0, (x)); else *cpu->insn.reg1b = (x); } while (0)
+#define STEAR0MW(x)  do { if (cpu->insn.op_memory) STEAMW(0, (x)); else *cpu->insn.reg0w = (x); } while (0)
+#define STEAR1MW(x)  do { if (cpu->insn.op_memory) STEAMW(0, (x)); else *cpu->insn.reg1w = (x); } while (0)
+
+#define LDSPB(n)  LDMB(REG_SS, cpu->regs.sp.w + (n))
+#define LDSPW(n)  LDMW(REG_SS, cpu->regs.sp.w + (n))
+
+#define STSPB(n, x)  do { STMB(REG_SS, cpu->regs.sp.w + (n), (x)); } while (0)
+#define STSPW(n, x)  do { STMW(REG_SS, cpu->regs.sp.w + (n), (x)); } while (0)
 
 
-
-static inline u8  *get_r8(CPU, uint r)  { return ((r & 0x04)? &cpu->regs.ax.h: &cpu->regs.ax.l) + 2 * (r & 0x03); }
-static inline u16 *get_r16(CPU, uint r) { return &cpu->regs.ax.w + (r & 0x07); }
-static inline u16 *get_rs(CPU, uint r)  { return &cpu->regs.es   + (r & 0x03); }
-
-
-static inline bool zero(  aluu x, uint m)                 { return (x & (2 * m - 1)) == 0; }
-static inline bool sign(  aluu x, uint m)                 { return (x & m) != 0; }
-static inline bool vflow( aluu x, aluu a, aluu b, uint m) { return sign(a, m) == sign(b, m) && sign(b, m) != sign(x, m); }
-static inline bool carry( aluu x, uint m)                 { return (x & (2 * m - 1)) != x; }
-static inline bool parity(aluu x) {
+static inline bool bit(   ureg x, uint b)                 { return (x & (1 << b)) != 0; }
+static inline ureg mask(  ureg x, uint b)                 { return x & ((1 << b) - 1); }
+static inline bool zero(  ureg x, uint n)                 { return mask(x, n) == 0; }
+static inline bool sign(  ureg x, uint n)                 { return bit(x, n - 1); }
+static inline bool vflow( ureg x, ureg a, ureg b, uint n) { return sign(a, n) == sign(b, n) && sign(b, n) != sign(x, n); }
+static inline bool carry( ureg x, uint n)                 { return mask(x, n) != x; }
+static inline bool parity(ureg x) {
 	x = x ^ (x >> 1);
 	x = x ^ (x >> 2);
 	x = x ^ (x >> 4);
 	return !(x & 1);
 }
 
-static inline aluu aluaddop(CPU, uint m, aluu x, aluu a, aluu b, bool d) {
-	cpu->flags.c = carry(x, m);
-	cpu->flags.v = vflow(x, a, b, m);
+static inline ureg getf_w(CPU) {
+	ureg flags = 0xf002;
+	if (cpu->flags.c) flags |= 1 <<  0;
+	if (cpu->flags.p) flags |= 1 <<  2;
+	if (cpu->flags.a) flags |= 1 <<  4;
+	if (cpu->flags.z) flags |= 1 <<  6;
+	if (cpu->flags.s) flags |= 1 <<  7;
+	if (cpu->flags.t) flags |= 1 <<  8;
+	if (cpu->flags.i) flags |= 1 <<  9;
+	if (cpu->flags.d) flags |= 1 << 10;
+	if (cpu->flags.v) flags |= 1 << 11;
+	return flags;
+}
+
+static inline void setf_lb(CPU, ureg flags) {
+	cpu->flags.c = bit(flags,  0);
+	cpu->flags.p = bit(flags,  2);
+	cpu->flags.a = bit(flags,  4);
+	cpu->flags.z = bit(flags,  6);
+	cpu->flags.s = bit(flags,  7);
+}
+
+static inline void setf_w(CPU, ureg flags) {
+	setf_lb(cpu, flags);
+	cpu->flags.t = bit(flags,  8);
+	cpu->flags.i = bit(flags,  9);
+	cpu->flags.d = bit(flags, 10);
+	cpu->flags.v = bit(flags, 11);
+}
+
+static inline void setf_pzs(CPU, uint n, ureg x) {
 	cpu->flags.p = parity(x);
-	cpu->flags.a = d ^ sign(x ^ a ^ b, 0x10);
-	cpu->flags.z = zero(x, m);
-	cpu->flags.s = sign(x, m);
+	cpu->flags.z = zero(x, n);
+	cpu->flags.s = sign(x, n);
+}
+
+static inline ureg setf_add(CPU, uint n, ureg x, ureg a, ureg b, bool d) {
+	cpu->flags.c = carry(x, n);
+	cpu->flags.v = vflow(x, a, b, n);
+	cpu->flags.a = sign(x ^ a ^ b, 5) != d;
+	setf_pzs(cpu, n, x);
 	return x;
 }
 
-static inline aluu aluincop(CPU, uint m, aluu x, aluu a, aluu b, bool d) { //Does not affect carry
-	cpu->flags.v = vflow(x, a, b, m);
-	cpu->flags.p = parity(x);
-	cpu->flags.a = d ^ sign(x ^ a ^ b, 0x10);
-	cpu->flags.z = zero(x, m);
-	cpu->flags.s = sign(x, m);
+static inline ureg setf_inc(CPU, uint n, ureg x, ureg a, ureg b, bool d) {
+	cpu->flags.v = vflow(x, a, b, n);
+	cpu->flags.a = sign(x ^ a ^ b, 5) != d;
+	setf_pzs(cpu, n, x);
 	return x;
 }
 
-static inline aluu alulogop(CPU, uint m, aluu x) { // C=0, V=0, A=0
+static inline ureg setf_log(CPU, uint n, ureg x) {
 	cpu->flags.c = false;
 	cpu->flags.v = false;
-	cpu->flags.p = parity(x);
 	cpu->flags.a = false;
-	cpu->flags.z = zero(x, m);
-	cpu->flags.s = sign(x, m);
+	setf_pzs(cpu, n, x);
 	return x;
 }
 
+static inline void setf_vxc(CPU, uint n, ureg x) { cpu->flags.v = bit(x, n - 1) ^ cpu->flags.c;  }
+static inline void setf_vxt(CPU, uint n, ureg x) { cpu->flags.v = bit(x, n - 1) ^ bit(x, n - 2); }
 
-static inline aluu add8( CPU, aluu a, aluu b) { return aluaddop(cpu, 0x80,   a + b,                a, b, false); }
-static inline aluu add16(CPU, aluu a, aluu b) { return aluaddop(cpu, 0x8000, a + b,                a, b, false); }
-static inline aluu adc8( CPU, aluu a, aluu b) { return aluaddop(cpu, 0x80,   a + b + cpu->flags.c, a, b, false); }
-static inline aluu adc16(CPU, aluu a, aluu b) { return aluaddop(cpu, 0x8000, a + b + cpu->flags.c, a, b, false); }
 
-static inline aluu sub8( CPU, aluu a, aluu b) { return aluaddop(cpu, 0x80,   a - b,                a, ~b, true); }
-static inline aluu sub16(CPU, aluu a, aluu b) { return aluaddop(cpu, 0x8000, a - b,                a, ~b, true); }
-static inline aluu sbb8( CPU, aluu a, aluu b) { return aluaddop(cpu, 0x80,   a - b - cpu->flags.c, a, ~b, true); }
-static inline aluu sbb16(CPU, aluu a, aluu b) { return aluaddop(cpu, 0x8000, a - b - cpu->flags.c, a, ~b, true); }
+static inline ureg add8( CPU, ureg a, ureg b) { return setf_add(cpu,  8, a + b,                a, b, false); }
+static inline ureg add16(CPU, ureg a, ureg b) { return setf_add(cpu, 16, a + b,                a, b, false); }
+static inline ureg adc8( CPU, ureg a, ureg b) { return setf_add(cpu,  8, a + b + cpu->flags.c, a, b, false); }
+static inline ureg adc16(CPU, ureg a, ureg b) { return setf_add(cpu, 16, a + b + cpu->flags.c, a, b, false); }
 
-static inline aluu inc8( CPU, aluu a) { return aluincop(cpu, 0x80,   a + 1, a,  1, false); }
-static inline aluu inc16(CPU, aluu a) { return aluincop(cpu, 0x8000, a + 1, a,  1, false); }
-static inline aluu dec8( CPU, aluu a) { return aluincop(cpu, 0x80,   a - 1, a, ~1, true);  }
-static inline aluu dec16(CPU, aluu a) { return aluincop(cpu, 0x8000, a - 1, a, ~1, true);  }
+static inline ureg sub8( CPU, ureg a, ureg b) { return setf_add(cpu,  8, a - b,                a, ~b, true); }
+static inline ureg sub16(CPU, ureg a, ureg b) { return setf_add(cpu, 16, a - b,                a, ~b, true); }
+static inline ureg sbb8( CPU, ureg a, ureg b) { return setf_add(cpu,  8, a - b - cpu->flags.c, a, ~b, true); }
+static inline ureg sbb16(CPU, ureg a, ureg b) { return setf_add(cpu, 16, a - b - cpu->flags.c, a, ~b, true); }
 
-static inline aluu and8(CPU, aluu a, aluu b) { return alulogop(cpu, 0x80, a & b); }
-static inline aluu ior8(CPU, aluu a, aluu b) { return alulogop(cpu, 0x80, a | b); }
-static inline aluu xor8(CPU, aluu a, aluu b) { return alulogop(cpu, 0x80, a ^ b); }
+static inline ureg inc8( CPU, ureg a) { return setf_inc(cpu,  8, a + 1, a,  1, false); }
+static inline ureg inc16(CPU, ureg a) { return setf_inc(cpu, 16, a + 1, a,  1, false); }
+static inline ureg dec8( CPU, ureg a) { return setf_inc(cpu,  8, a - 1, a, ~1, true);  }
+static inline ureg dec16(CPU, ureg a) { return setf_inc(cpu, 16, a - 1, a, ~1, true);  }
 
-static inline aluu and16(CPU, aluu a, u16 b) { return alulogop(cpu, 0x8000, a & b); }
-static inline aluu ior16(CPU, aluu a, u16 b) { return alulogop(cpu, 0x8000, a | b); }
-static inline aluu xor16(CPU, aluu a, u16 b) { return alulogop(cpu, 0x8000, a ^ b); }
+static inline ureg and8(CPU, ureg a, ureg b) { return setf_log(cpu, 8, a & b); }
+static inline ureg ior8(CPU, ureg a, ureg b) { return setf_log(cpu, 8, a | b); }
+static inline ureg xor8(CPU, ureg a, ureg b) { return setf_log(cpu, 8, a ^ b); }
+
+static inline ureg and16(CPU, ureg a, u16 b) { return setf_log(cpu, 16, a & b); }
+static inline ureg ior16(CPU, ureg a, u16 b) { return setf_log(cpu, 16, a | b); }
+static inline ureg xor16(CPU, ureg a, u16 b) { return setf_log(cpu, 16, a ^ b); }
 
 static inline u8 shrb(u8 a)         { return a >> 1; }
 static inline u8 shlb(u8 a)         { return a << 1; }
@@ -142,986 +257,590 @@ static inline u8 rolb(u8 a)         { return (a << 1) | (a >> 7); }
 static inline u8 rcrb(u8 a, bool c) { return (a >> 1) | (a << 8) | (c << 7); }
 static inline u8 rclb(u8 a, bool c) { return (a << 1) | (a >> 8) | c; }
 
-static inline aluu shrw(u16 a)         { return a >> 1; }
-static inline aluu shlw(u16 a)         { return a << 1; }
-static inline aluu sarw(u16 a)         { return (i16)a >> 1; }
-static inline aluu salw(u16 a)         { return (i16)a << 1; }
-static inline aluu rorw(u16 a)         { return (a >> 1) | (a << 15); }
-static inline aluu rolw(u16 a)         { return (a << 1) | (a >> 15); }
-static inline aluu rcrw(u16 a, bool c) { return (a >> 1) | (a << 16) | (c << 15); }
-static inline aluu rclw(u16 a, bool c) { return (a << 1) | (a >> 16) | c; }
+static inline ureg shrw(u16 a)         { return a >> 1; }
+static inline ureg shlw(u16 a)         { return a << 1; }
+static inline ureg sarw(u16 a)         { return (i16)a >> 1; }
+static inline ureg salw(u16 a)         { return (i16)a << 1; }
+static inline ureg rorw(u16 a)         { return (a >> 1) | (a << 15); }
+static inline ureg rolw(u16 a)         { return (a << 1) | (a >> 15); }
+static inline ureg rcrw(u16 a, bool c) { return (a >> 1) | (a << 16) | (c << 15); }
+static inline ureg rclw(u16 a, bool c) { return (a << 1) | (a >> 16) | c; }
 
 
-aluu rol8(CPU, aluu a, uint b, bool v)
+
+static ureg rol8(CPU, ureg a, uint b)
 {
 
-	u8   x = a;
+	while (b >= 8)            { cpu->flags.c = bit(a, 0); b -= 8; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 7); a = rolb(a); }
+
+	setf_vxc(cpu, 8, a);
+	return a;
+
+}
+
+
+
+static ureg ror8(CPU, ureg a, uint b)
+{
+
+	while (b >= 8)            { cpu->flags.c = bit(a, 7); b -= 8; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 0); a = rorb(a); }
+
+	setf_vxt(cpu, 8, a);
+	return a;
+
+}
+
+
+
+static ureg rol16(CPU, ureg a, uint b)
+{
+
+	while (b >= 16)           { cpu->flags.c = bit(a,  0); b -= 16; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 15); a = rolw(a); }
+
+	setf_vxc(cpu, 16, a);
+	return a;
+
+}
+
+
+
+static ureg ror16(CPU, ureg a, uint b)
+{
+
+	while (b >= 16)           { cpu->flags.c = bit(a, 15); b -= 16; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a,  0); a = rorw(a); }
+
+	setf_vxt(cpu, 16, a);
+	return a;
+
+}
+
+
+
+static ureg rcl8(CPU, ureg a, uint b)
+{
+
 	bool c = cpu->flags.c;
 
-	while (true)
-		switch (b) {
+	while (b >= 9)            { b -= 9; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 7); a = rclb(a, c); c = cpu->flags.c; }
 
-			case 7: c = sign(x, 0x80); x = rolb(x);
-			case 6: c = sign(x, 0x80); x = rolb(x);
-			case 5: c = sign(x, 0x80); x = rolb(x);
-			case 4: c = sign(x, 0x80); x = rolb(x);
-			case 3: c = sign(x, 0x80); x = rolb(x);
-			case 2: c = sign(x, 0x80); x = rolb(x);
-			case 1: c = sign(x, 0x80); x = rolb(x);
-			case 0: goto done;
-
-			default:
-				c = sign(x, 0x01);
-				b -= 8;
-
-		}
-
-done:
-	cpu->flags.c = c;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x80) ^ c;
-
-	return x;
+	setf_vxc(cpu, 8, a);
+	return a;
 
 }
 
 
 
-aluu ror8(CPU, aluu a, uint b, bool v)
+static ureg rcr8(CPU, ureg a, uint b)
 {
 
-	u8   x = a;
 	bool c = cpu->flags.c;
 
-	while (true)
-		switch (b) {
+	while (b >= 9)            { b -= 9; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 0); a = rcrb(a, c); c = cpu->flags.c; }
 
-			case 7: c = sign(x, 0x01); x = rorb(x);
-			case 6: c = sign(x, 0x01); x = rorb(x);
-			case 5: c = sign(x, 0x01); x = rorb(x);
-			case 4: c = sign(x, 0x01); x = rorb(x);
-			case 3: c = sign(x, 0x01); x = rorb(x);
-			case 2: c = sign(x, 0x01); x = rorb(x);
-			case 1: c = sign(x, 0x01); x = rorb(x);
-			case 0: goto done;
-
-			default:
-				c = sign(x, 0x80);
-				b -= 8;
-
-		}
-
-done:
-	cpu->flags.c = c;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x80) ^ sign(x, 0x40);
-
-	return x;
+	setf_vxt(cpu, 8, a);
+	return a;
 
 }
 
 
 
-aluu rol16(CPU, aluu a, uint b, bool v)
+static ureg rcl16(CPU, ureg a, uint b)
 {
 
-	u16  x = a;
 	bool c = cpu->flags.c;
 
-	while (true)
-		switch (b) {
+	while (b >= 17)           { b -= 17; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 15); a = rclw(a, c); c = cpu->flags.c; }
 
-			case 15: c = sign(x, 0x8000); x = rolw(x);
-			case 14: c = sign(x, 0x8000); x = rolw(x);
-			case 13: c = sign(x, 0x8000); x = rolw(x);
-			case 12: c = sign(x, 0x8000); x = rolw(x);
-			case 11: c = sign(x, 0x8000); x = rolw(x);
-			case 10: c = sign(x, 0x8000); x = rolw(x);
-			case  9: c = sign(x, 0x8000); x = rolw(x);
-			case  8: c = sign(x, 0x8000); x = rolw(x);
-			case  7: c = sign(x, 0x8000); x = rolw(x);
-			case  6: c = sign(x, 0x8000); x = rolw(x);
-			case  5: c = sign(x, 0x8000); x = rolw(x);
-			case  4: c = sign(x, 0x8000); x = rolw(x);
-			case  3: c = sign(x, 0x8000); x = rolw(x);
-			case  2: c = sign(x, 0x8000); x = rolw(x);
-			case  1: c = sign(x, 0x8000); x = rolw(x);
-			case  0: goto done;
-
-			default:
-				c = sign(x, 0x0001);
-				b -= 16;
-
-		}
-
-done:
-	cpu->flags.c = c;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x8000) ^ c;
-
-	return x;
+	setf_vxc(cpu, 16, a);
+	return a;
 
 }
 
 
 
-aluu ror16(CPU, aluu a, uint b, bool v)
+static ureg rcr16(CPU, ureg a, uint b)
 {
 
-	u16  x = a;
 	bool c = cpu->flags.c;
 
-	while (true)
-		switch (b) {
+	while (b >= 17)           { b -= 17; }
+	for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 0); a = rcrw(a, c); c = cpu->flags.c; }
 
-			case 15: c = sign(x, 0x0001); x = rorw(x);
-			case 14: c = sign(x, 0x0001); x = rorw(x);
-			case 13: c = sign(x, 0x0001); x = rorw(x);
-			case 12: c = sign(x, 0x0001); x = rorw(x);
-			case 11: c = sign(x, 0x0001); x = rorw(x);
-			case 10: c = sign(x, 0x0001); x = rorw(x);
-			case  9: c = sign(x, 0x0001); x = rorw(x);
-			case  8: c = sign(x, 0x0001); x = rorw(x);
-			case  7: c = sign(x, 0x0001); x = rorw(x);
-			case  6: c = sign(x, 0x0001); x = rorw(x);
-			case  5: c = sign(x, 0x0001); x = rorw(x);
-			case  4: c = sign(x, 0x0001); x = rorw(x);
-			case  3: c = sign(x, 0x0001); x = rorw(x);
-			case  2: c = sign(x, 0x0001); x = rorw(x);
-			case  1: c = sign(x, 0x0001); x = rorw(x);
-			case  0: goto done;
-
-			default:
-				c = sign(x, 0x8000);
-				b -= 16;
-
-		}
-
-done:
-	cpu->flags.c = c;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x8000) ^ sign(x, 0x4000);
-
-	return x;
+	setf_vxt(cpu, 16, a);
+	return a;
 
 }
 
 
 
-
-aluu rcl8(CPU, aluu a, uint b, bool v)
+static ureg shl8(CPU, ureg a, uint b)
 {
 
-	u8   x  = a;
-	bool ci = cpu->flags.c;
-	bool co = ci;
+	if (b < 8) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 7); a = shlb(a); }
+	else       a = 0;
 
-	while (true)
-		switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 8, a);
 
-			case 8: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 7: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 6: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 5: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 4: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 3: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 2: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 1: co = sign(x, 0x80); x = rclb(x, ci); ci = co;
-			case 0: goto done;
-
-			default:
-				b -= 9;
-
-		}
-
-done:
-	cpu->flags.c = co;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x80) ^ co;
-
-	return x;
+	setf_vxc(cpu, 8, a);
+	return a;
 
 }
 
 
 
-aluu rcr8(CPU, aluu a, uint b, bool v)
+static ureg shr8(CPU, ureg a, uint b)
 {
 
-	u8   x  = a;
-	bool ci = cpu->flags.c;
-	bool co = ci;
+	if (b < 8) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 0); a = shrb(a); }
+	else       a = 0;
 
-	while (true)
-		switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 8, a);
 
-			case 8: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 7: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 6: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 5: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 4: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 3: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 2: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 1: co = sign(x, 0x01); x = rcrb(x, ci); ci = co;
-			case 0: goto done;
-
-			default:
-				b -= 9;
-
-		}
-
-done:
-	cpu->flags.c = co;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x80) ^ sign(x, 0x40);
-
-	return x;
+	setf_vxt(cpu, 8, a);
+	return a;
 
 }
 
 
 
-aluu rcl16(CPU, aluu a, uint b, bool v)
+static ureg shl16(CPU, ureg a, uint b)
 {
 
-	u16  x  = a;
-	bool ci = cpu->flags.c;
-	bool co = ci;
+	if (b < 16) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 15); a = shlw(a); }
+	else        a = 0;
 
-	while (true)
-		switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 16, a);
 
-			case 16: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case 15: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case 14: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case 13: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case 12: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case 11: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case 10: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  9: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  8: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  7: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  6: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  5: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  4: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  3: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  2: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  1: co = sign(x, 0x8000); x = rclw(x, ci); ci = co;
-			case  0: goto done;
-
-			default:
-				b -= 17;
-
-		}
-
-done:
-	cpu->flags.c = co;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x8000) ^ co;
-
-	return x;
+	setf_vxc(cpu, 16, a);
+	return a;
 
 }
 
 
 
-aluu rcr16(CPU, aluu a, uint b, bool v)
+static ureg shr16(CPU, ureg a, uint b)
 {
 
-	u16  x  = a;
-	bool ci = cpu->flags.c;
-	bool co = ci;
+	if (b < 16) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 0); a = shrw(a); }
+	else       a = 0;
 
-	while (true)
-		switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 16, a);
 
-			case 16: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case 15: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case 14: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case 13: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case 12: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case 11: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case 10: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  9: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  8: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  7: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  6: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  5: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  4: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  3: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  2: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  1: co = sign(x, 0x0001); x = rcrw(x, ci); ci = co;
-			case  0: goto done;
-
-			default:
-				b -= 17;
-
-		}
-
-done:
-	cpu->flags.c = co;
-
-	if (v)
-		cpu->flags.v = sign(x, 0x8000) ^ sign(x, 0x4000);
-
-	return x;
+	setf_vxt(cpu, 16, a);
+	return a;
 
 }
 
 
 
-aluu shl8(CPU, aluu a, uint b, bool v)
+static ureg sal8(CPU, ureg a, uint b)
 {
 
-	u8   x = a;
-	bool c = cpu->flags.c;
+	if (b < 8) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 7); a = salb(a); }
+	else       a = 0;
 
-	switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 8, a);
 
-		case 7: c = sign(x, 0x80); x = shlb(x);
-		case 6: c = sign(x, 0x80); x = shlb(x);
-		case 5: c = sign(x, 0x80); x = shlb(x);
-		case 4: c = sign(x, 0x80); x = shlb(x);
-		case 3: c = sign(x, 0x80); x = shlb(x);
-		case 2: c = sign(x, 0x80); x = shlb(x);
-		case 1: c = sign(x, 0x80); x = shlb(x);
-		case 0: goto done;
-
-		default:
-			x = 0;
-
-	}
-
-done:
-	if (v) {
-
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x80) ^ c;
-
-	}
-
-	if (b > 0) {
-
-		cpu->flags.p = parity(x);
-		cpu->flags.z = zero(x, 0x80);
-		cpu->flags.s = sign(x, 0x80);
-
-	}
-
-	return x;
+	setf_vxc(cpu, 8, a);
+	return a;
 
 }
 
 
 
-aluu shr8(CPU, aluu a, uint b, bool v)
+static ureg sar8(CPU, ureg a, uint b)
 {
 
-	u8   x = a;
-	bool c = cpu->flags.c;
+	if (b < 8) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 0); a = sarb(a); }
+	else       a = sign(a, 8)? 0xff: 0;
 
-	switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 8, a);
 
-		case 7: c = sign(x, 0x01); x = shrb(x);
-		case 6: c = sign(x, 0x01); x = shrb(x);
-		case 5: c = sign(x, 0x01); x = shrb(x);
-		case 4: c = sign(x, 0x01); x = shrb(x);
-		case 3: c = sign(x, 0x01); x = shrb(x);
-		case 2: c = sign(x, 0x01); x = shrb(x);
-		case 1: c = sign(x, 0x01); x = shrb(x);
-		case 0: goto done;
-
-		default:
-			x = 0;
-
-	}
-
-done:
-	if (v) {
-
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x80) ^ sign(x, 0x40);
-
-	}
-
-	if (b > 0) {
-
-		cpu->flags.p = parity(x);
-		cpu->flags.z = zero(x, 0x80);
-		cpu->flags.s = sign(x, 0x80);
-
-	}
-
-	return x;
+	setf_vxt(cpu, 8, a);
+	return a;
 
 }
 
 
 
-aluu shl16(CPU, aluu a, uint b, bool v)
+static ureg sal16(CPU, ureg a, uint b)
 {
 
-	u16  x = a;
-	bool c = cpu->flags.c;
+	if (b < 16) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 15); a = salw(a); }
+	else        a = 0;
 
-	switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 16, a);
 
-		case 15: c = sign(x, 0x8000); x = shlw(x);
-		case 14: c = sign(x, 0x8000); x = shlw(x);
-		case 13: c = sign(x, 0x8000); x = shlw(x);
-		case 12: c = sign(x, 0x8000); x = shlw(x);
-		case 11: c = sign(x, 0x8000); x = shlw(x);
-		case 10: c = sign(x, 0x8000); x = shlw(x);
-		case  9: c = sign(x, 0x8000); x = shlw(x);
-		case  8: c = sign(x, 0x8000); x = shlw(x);
-		case  7: c = sign(x, 0x8000); x = shlw(x);
-		case  6: c = sign(x, 0x8000); x = shlw(x);
-		case  5: c = sign(x, 0x8000); x = shlw(x);
-		case  4: c = sign(x, 0x8000); x = shlw(x);
-		case  3: c = sign(x, 0x8000); x = shlw(x);
-		case  2: c = sign(x, 0x8000); x = shlw(x);
-		case  1: c = sign(x, 0x8000); x = shlw(x);
-		case  0: goto done;
-
-		default:
-			x = 0;
-
-	}
-
-done:
-	if (v) {
-
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x8000) ^ c;
-
-	}
-
-	if (b > 0) {
-
-		cpu->flags.p = parity(x);
-		cpu->flags.z = zero(x, 0x8000);
-		cpu->flags.s = sign(x, 0x8000);
-
-	}
-
-	return x;
+	setf_vxc(cpu, 16, a);
+	return a;
 
 }
 
 
 
-aluu shr16(CPU, aluu a, uint b, bool v)
+static ureg sar16(CPU, ureg a, uint b)
 {
 
-	u16  x = a;
-	bool c = cpu->flags.c;
+	if (b < 16) for (int n=0; n < b; n++) { cpu->flags.c = bit(a, 0); a = sarw(a); }
+	else       a = sign(a, 16)? 0xffff: 0;
 
-	switch (b) {
+	if (b > 0)
+		setf_pzs(cpu, 16, a);
 
-		case 15: c = sign(x, 0x0001); x = shrw(x);
-		case 14: c = sign(x, 0x0001); x = shrw(x);
-		case 13: c = sign(x, 0x0001); x = shrw(x);
-		case 12: c = sign(x, 0x0001); x = shrw(x);
-		case 11: c = sign(x, 0x0001); x = shrw(x);
-		case 10: c = sign(x, 0x0001); x = shrw(x);
-		case  9: c = sign(x, 0x0001); x = shrw(x);
-		case  8: c = sign(x, 0x0001); x = shrw(x);
-		case  7: c = sign(x, 0x0001); x = shrw(x);
-		case  6: c = sign(x, 0x0001); x = shrw(x);
-		case  5: c = sign(x, 0x0001); x = shrw(x);
-		case  4: c = sign(x, 0x0001); x = shrw(x);
-		case  3: c = sign(x, 0x0001); x = shrw(x);
-		case  2: c = sign(x, 0x0001); x = shrw(x);
-		case  1: c = sign(x, 0x0001); x = shrw(x);
-		case  0: goto done;
-
-		default:
-			x = 0;
-
-	}
-
-done:
-	if (v) {
-
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x8000) ^ sign(x, 0x4000);
-
-	}
-
-	if (b > 0) {
-
-		cpu->flags.p = parity(x);
-		cpu->flags.a = false;
-		cpu->flags.z = zero(x, 0x8000);
-		cpu->flags.s = sign(x, 0x8000);
-
-	}
-
-	return x;
+	setf_vxt(cpu, 16, a);
+	return a;
 
 }
 
 
 
-aluu sal8(CPU, aluu a, uint b, bool v)
+static inline void *memlock(CPU, uint seg, u16 ofs, uint len) {
+	//return cpu->memory.descriptor[seg].base + ofs;
+	return cpu->memory.mem.base + ((SEGMENT(seg) * 16 + ofs) & cpu->memory.mem.mask);
+}
+
+
+
+static void memselect(CPU, uint seg, u16 selector)
 {
 
-	u8   x = a;
-	bool c = cpu->flags.c;
+	auto md = &cpu->memory.descriptor[seg];
 
-	switch (b) {
+	cpu->memory.selector[seg] = selector;
 
-		case 7: c = sign(x, 0x80); x = salb(x);
-		case 6: c = sign(x, 0x80); x = salb(x);
-		case 5: c = sign(x, 0x80); x = salb(x);
-		case 4: c = sign(x, 0x80); x = salb(x);
-		case 3: c = sign(x, 0x80); x = salb(x);
-		case 2: c = sign(x, 0x80); x = salb(x);
-		case 1: c = sign(x, 0x80); x = salb(x);
-		case 0: goto done;
-
-		default:
-			x = 0;
-
-	}
-
-done:
-	if (v) {
-
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x80) ^ c;
-
-	}
-
-	if (b > 0) {
-
-		cpu->flags.p = parity(x);
-		cpu->flags.z = zero(x, 0x80);
-		cpu->flags.s = sign(x, 0x80);
-
-	}
-
-	return x;
+	md->base   = cpu->memory.mem.base + ((selector * 16) & cpu->memory.mem.mask);
+	md->limit  = cpu->memory.mem.limit;
+	md->length = 65536;
+	md->mask   = 65535;
 
 }
 
 
-
-aluu sar8(CPU, aluu a, uint b, bool v)
+static void interrupt(CPU, uint irq, uint rcs, uint rip)
 {
 
-	u8   x = a;
-	bool c = cpu->flags.c;
+	ADVSP(-6);
+	STSPW(4, getf_w(cpu));
+	STSPW(2, rcs);
+	STSPW(0, rip);
 
-	switch (b) {
+	cpu->flags.i = false;
+	cpu->flags.t = false;
 
-		case 7: c = sign(x, 0x01); x = sarb(x);
-		case 6: c = sign(x, 0x01); x = sarb(x);
-		case 5: c = sign(x, 0x01); x = sarb(x);
-		case 4: c = sign(x, 0x01); x = sarb(x);
-		case 3: c = sign(x, 0x01); x = sarb(x);
-		case 2: c = sign(x, 0x01); x = sarb(x);
-		case 1: c = sign(x, 0x01); x = sarb(x);
-		case 0: goto done;
-
-		default:
-			x = sign(x, 0x80)? 0xff: 0;
-
-	}
-
-done:
-	if (v) {
-
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x80) ^ sign(x, 0x40);
-
-	}
-
-	if (b > 0) {
-
-		cpu->flags.p = parity(x);
-		cpu->flags.z = zero(x, 0x80);
-		cpu->flags.s = sign(x, 0x80);
-
-	}
-
-	return x;
+	cpu->regs.ip = LDMW(REG_ZERO, 4 * (u8)irq + 0);
+	memselect(cpu, REG_CS, LDMW(REG_ZERO, 4 * (u8)irq + 2));
 
 }
 
 
 
-aluu sal16(CPU, aluu a, uint b, bool v)
-{
+static void op_undef(CPU) { cpu->undef(cpu); }   // Invalid opcode
+static void op_nop(CPU)   { }
 
-	u16  x = a;
-	bool c = cpu->flags.c;
+static void op_addaib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = add8(cpu, cpu->regs.ax.l, imm); }
+static void op_ioraib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = ior8(cpu, cpu->regs.ax.l, imm); }
+static void op_adcaib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = adc8(cpu, cpu->regs.ax.l, imm); }
+static void op_sbbaib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = sbb8(cpu, cpu->regs.ax.l, imm); }
+static void op_andaib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = and8(cpu, cpu->regs.ax.l, imm); }
+static void op_subaib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = sub8(cpu, cpu->regs.ax.l, imm); }
+static void op_xoraib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = xor8(cpu, cpu->regs.ax.l, imm); }
+static void op_cmpaib(CPU) { const u8 imm = LDIPUB();                  sub8(cpu, cpu->regs.ax.l, imm); }
 
-	switch (b) {
+static void op_addaiw(CPU) { const u16 imm = LDIPUW(); cpu->regs.ax.w = add16(cpu, cpu->regs.ax.w, imm); }
+static void op_ioraiw(CPU) { const u16 imm = LDIPUW(); cpu->regs.ax.w = ior16(cpu, cpu->regs.ax.w, imm); }
+static void op_adcaiw(CPU) { const u16 imm = LDIPUW(); cpu->regs.ax.w = adc16(cpu, cpu->regs.ax.w, imm); }
+static void op_sbbaiw(CPU) { const u16 imm = LDIPUW(); cpu->regs.ax.w = sbb16(cpu, cpu->regs.ax.w, imm); }
+static void op_andaiw(CPU) { const u16 imm = LDIPUW(); cpu->regs.ax.w = and16(cpu, cpu->regs.ax.w, imm); }
+static void op_subaiw(CPU) { const u16 imm = LDIPUW(); cpu->regs.ax.w = sub16(cpu, cpu->regs.ax.w, imm); }
+static void op_xoraiw(CPU) { const u16 imm = LDIPUW(); cpu->regs.ax.w = xor16(cpu, cpu->regs.ax.w, imm); }
+static void op_cmpaiw(CPU) { const u16 imm = LDIPUW();                  sub16(cpu, cpu->regs.ax.w, imm); }
 
-		case 15: c = sign(x, 0x8000); x = salw(x);
-		case 14: c = sign(x, 0x8000); x = salw(x);
-		case 13: c = sign(x, 0x8000); x = salw(x);
-		case 12: c = sign(x, 0x8000); x = salw(x);
-		case 11: c = sign(x, 0x8000); x = salw(x);
-		case 10: c = sign(x, 0x8000); x = salw(x);
-		case  9: c = sign(x, 0x8000); x = salw(x);
-		case  8: c = sign(x, 0x8000); x = salw(x);
-		case  7: c = sign(x, 0x8000); x = salw(x);
-		case  6: c = sign(x, 0x8000); x = salw(x);
-		case  5: c = sign(x, 0x8000); x = salw(x);
-		case  4: c = sign(x, 0x8000); x = salw(x);
-		case  3: c = sign(x, 0x8000); x = salw(x);
-		case  2: c = sign(x, 0x8000); x = salw(x);
-		case  1: c = sign(x, 0x8000); x = salw(x);
-		case  0: goto done;
+static void op_addrmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB(); STLCKM(add8(cpu, LDLCKM(), imm)); }
+static void op_iorrmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB(); STLCKM(ior8(cpu, LDLCKM(), imm)); }
+static void op_adcrmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB(); STLCKM(adc8(cpu, LDLCKM(), imm)); }
+static void op_sbbrmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB(); STLCKM(sbb8(cpu, LDLCKM(), imm)); }
+static void op_andrmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB(); STLCKM(and8(cpu, LDLCKM(), imm)); }
+static void op_subrmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB(); STLCKM(sub8(cpu, LDLCKM(), imm)); }
+static void op_xorrmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB(); STLCKM(xor8(cpu, LDLCKM(), imm)); }
+static void op_cmprmbib(CPU) { LOCKR1MB(); const u8 imm = LDIPUB();        sub8(cpu, LDLCKM(), imm);  }
 
-		default:
-			x = 0;
+static void op_addrmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW(); STLCKM(add16(cpu, LDLCKM(), imm)); }
+static void op_iorrmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW(); STLCKM(ior16(cpu, LDLCKM(), imm)); }
+static void op_adcrmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW(); STLCKM(adc16(cpu, LDLCKM(), imm)); }
+static void op_sbbrmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW(); STLCKM(sbb16(cpu, LDLCKM(), imm)); }
+static void op_andrmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW(); STLCKM(and16(cpu, LDLCKM(), imm)); }
+static void op_subrmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW(); STLCKM(sub16(cpu, LDLCKM(), imm)); }
+static void op_xorrmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW(); STLCKM(xor16(cpu, LDLCKM(), imm)); }
+static void op_cmprmwiw(CPU) { LOCKR1MW(); const u16 imm = LDIPUW();        sub16(cpu, LDLCKM(), imm);  }
 
-	}
+static void op_addrmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB(); STLCKM(add16(cpu, LDLCKM(), imm)); }
+static void op_iorrmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB(); STLCKM(ior16(cpu, LDLCKM(), imm)); }
+static void op_adcrmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB(); STLCKM(adc16(cpu, LDLCKM(), imm)); }
+static void op_sbbrmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB(); STLCKM(sbb16(cpu, LDLCKM(), imm)); }
+static void op_andrmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB(); STLCKM(and16(cpu, LDLCKM(), imm)); }
+static void op_subrmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB(); STLCKM(sub16(cpu, LDLCKM(), imm)); }
+static void op_xorrmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB(); STLCKM(xor16(cpu, LDLCKM(), imm)); }
+static void op_cmprmwib(CPU) { LOCKR1MW(); const u16 imm = LDIPSB();        sub16(cpu, LDLCKM(), imm);  }
 
-done:
-	if (v) {
+static void op_addrmbf(CPU) { LOCKR1MB(); *cpu->insn.reg0b = add8(cpu, *cpu->insn.reg0b, LDLCKM()); }
+static void op_iorrmbf(CPU) { LOCKR1MB(); *cpu->insn.reg0b = ior8(cpu, *cpu->insn.reg0b, LDLCKM()); }
+static void op_adcrmbf(CPU) { LOCKR1MB(); *cpu->insn.reg0b = adc8(cpu, *cpu->insn.reg0b, LDLCKM()); }
+static void op_sbbrmbf(CPU) { LOCKR1MB(); *cpu->insn.reg0b = sbb8(cpu, *cpu->insn.reg0b, LDLCKM()); }
+static void op_andrmbf(CPU) { LOCKR1MB(); *cpu->insn.reg0b = and8(cpu, *cpu->insn.reg0b, LDLCKM()); }
+static void op_subrmbf(CPU) { LOCKR1MB(); *cpu->insn.reg0b = sub8(cpu, *cpu->insn.reg0b, LDLCKM()); }
+static void op_xorrmbf(CPU) { LOCKR1MB(); *cpu->insn.reg0b = xor8(cpu, *cpu->insn.reg0b, LDLCKM()); }
+static void op_cmprmbf(CPU) { LOCKR1MB();                    sub8(cpu, *cpu->insn.reg0b, LDLCKM()); }
 
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x8000) ^ c;
+static void op_addrmwf(CPU) { LOCKR1MW(); *cpu->insn.reg0w = add16(cpu, *cpu->insn.reg0w, LDLCKM()); }
+static void op_iorrmwf(CPU) { LOCKR1MW(); *cpu->insn.reg0w = ior16(cpu, *cpu->insn.reg0w, LDLCKM()); }
+static void op_adcrmwf(CPU) { LOCKR1MW(); *cpu->insn.reg0w = adc16(cpu, *cpu->insn.reg0w, LDLCKM()); }
+static void op_sbbrmwf(CPU) { LOCKR1MW(); *cpu->insn.reg0w = sbb16(cpu, *cpu->insn.reg0w, LDLCKM()); }
+static void op_andrmwf(CPU) { LOCKR1MW(); *cpu->insn.reg0w = and16(cpu, *cpu->insn.reg0w, LDLCKM()); }
+static void op_subrmwf(CPU) { LOCKR1MW(); *cpu->insn.reg0w = sub16(cpu, *cpu->insn.reg0w, LDLCKM()); }
+static void op_xorrmwf(CPU) { LOCKR1MW(); *cpu->insn.reg0w = xor16(cpu, *cpu->insn.reg0w, LDLCKM()); }
+static void op_cmprmwf(CPU) { LOCKR1MW();                    sub16(cpu, *cpu->insn.reg0w, LDLCKM()); }
 
-	}
+static void op_addrmbr(CPU) { LOCKR1MB(); STLCKM(add8(cpu, LDLCKM(), *cpu->insn.reg0b)); }
+static void op_iorrmbr(CPU) { LOCKR1MB(); STLCKM(ior8(cpu, LDLCKM(), *cpu->insn.reg0b)); }
+static void op_adcrmbr(CPU) { LOCKR1MB(); STLCKM(adc8(cpu, LDLCKM(), *cpu->insn.reg0b)); }
+static void op_sbbrmbr(CPU) { LOCKR1MB(); STLCKM(sbb8(cpu, LDLCKM(), *cpu->insn.reg0b)); }
+static void op_andrmbr(CPU) { LOCKR1MB(); STLCKM(and8(cpu, LDLCKM(), *cpu->insn.reg0b)); }
+static void op_subrmbr(CPU) { LOCKR1MB(); STLCKM(sub8(cpu, LDLCKM(), *cpu->insn.reg0b)); }
+static void op_xorrmbr(CPU) { LOCKR1MB(); STLCKM(xor8(cpu, LDLCKM(), *cpu->insn.reg0b)); }
+static void op_cmprmbr(CPU) { LOCKR1MB();        sub8(cpu, LDLCKM(), *cpu->insn.reg0b);  }
 
-	if (b > 0) {
+static void op_addrmwr(CPU) { LOCKR1MW(); STLCKM(add16(cpu, LDLCKM(), *cpu->insn.reg0w)); }
+static void op_iorrmwr(CPU) { LOCKR1MW(); STLCKM(ior16(cpu, LDLCKM(), *cpu->insn.reg0w)); }
+static void op_adcrmwr(CPU) { LOCKR1MW(); STLCKM(adc16(cpu, LDLCKM(), *cpu->insn.reg0w)); }
+static void op_sbbrmwr(CPU) { LOCKR1MW(); STLCKM(sbb16(cpu, LDLCKM(), *cpu->insn.reg0w)); }
+static void op_andrmwr(CPU) { LOCKR1MW(); STLCKM(and16(cpu, LDLCKM(), *cpu->insn.reg0w)); }
+static void op_subrmwr(CPU) { LOCKR1MW(); STLCKM(sub16(cpu, LDLCKM(), *cpu->insn.reg0w)); }
+static void op_xorrmwr(CPU) { LOCKR1MW(); STLCKM(xor16(cpu, LDLCKM(), *cpu->insn.reg0w)); }
+static void op_cmprmwr(CPU) { LOCKR1MW();        sub16(cpu, LDLCKM(), *cpu->insn.reg0w);  }
 
-		cpu->flags.p = parity(x);
-		cpu->flags.z = zero(x, 0x8000);
-		cpu->flags.s = sign(x, 0x8000);
+static void op_decrmb(CPU) { LOCKR1MB(); STLCKM(dec8(cpu, LDLCKM())); }
+static void op_incrmb(CPU) { LOCKR1MB(); STLCKM(inc8(cpu, LDLCKM())); }
 
-	}
+static void op_decrmw(CPU) { LOCKR1MW(); STLCKM(dec16(cpu, LDLCKM())); }
+static void op_incrmw(CPU) { LOCKR1MW(); STLCKM(inc16(cpu, LDLCKM())); }
 
-	return x;
+static void op_decrw(CPU) { *cpu->insn.reg0w = dec16(cpu, *cpu->insn.reg0w); }
+static void op_incrw(CPU) { *cpu->insn.reg0w = inc16(cpu, *cpu->insn.reg0w); }
 
-}
+static void op_negrmb(CPU) { LOCKR1MB(); STLCKM(sub8( cpu, 0, LDLCKM())); }
+static void op_negrmw(CPU) { LOCKR1MW(); STLCKM(sub16(cpu, 0, LDLCKM())); }
 
+static void op_notrmb(CPU) { LOCKR1MB(); STLCKM(~LDLCKM()); }
+static void op_notrmw(CPU) { LOCKR1MW(); STLCKM(~LDLCKM()); }
 
+static void op_rolb1(CPU) { LOCKR1MB(); STLCKM(rol8(cpu, LDLCKM(), 1)); }
+static void op_rorb1(CPU) { LOCKR1MB(); STLCKM(ror8(cpu, LDLCKM(), 1)); }
+static void op_rclb1(CPU) { LOCKR1MB(); STLCKM(rcl8(cpu, LDLCKM(), 1)); }
+static void op_rcrb1(CPU) { LOCKR1MB(); STLCKM(rcr8(cpu, LDLCKM(), 1)); }
+static void op_shlb1(CPU) { LOCKR1MB(); STLCKM(shl8(cpu, LDLCKM(), 1)); }
+static void op_shrb1(CPU) { LOCKR1MB(); STLCKM(shr8(cpu, LDLCKM(), 1)); }
+static void op_salb1(CPU) { LOCKR1MB(); STLCKM(sal8(cpu, LDLCKM(), 1)); }
+static void op_sarb1(CPU) { LOCKR1MB(); STLCKM(sar8(cpu, LDLCKM(), 1)); }
 
-aluu sar16(CPU, aluu a, uint b, bool v)
-{
+static void op_rolw1(CPU) { LOCKR1MW(); STLCKM(rol16(cpu, LDLCKM(), 1)); }
+static void op_rorw1(CPU) { LOCKR1MW(); STLCKM(ror16(cpu, LDLCKM(), 1)); }
+static void op_rclw1(CPU) { LOCKR1MW(); STLCKM(rcl16(cpu, LDLCKM(), 1)); }
+static void op_rcrw1(CPU) { LOCKR1MW(); STLCKM(rcr16(cpu, LDLCKM(), 1)); }
+static void op_shlw1(CPU) { LOCKR1MW(); STLCKM(shl16(cpu, LDLCKM(), 1)); }
+static void op_shrw1(CPU) { LOCKR1MW(); STLCKM(shr16(cpu, LDLCKM(), 1)); }
+static void op_salw1(CPU) { LOCKR1MW(); STLCKM(sal16(cpu, LDLCKM(), 1)); }
+static void op_sarw1(CPU) { LOCKR1MW(); STLCKM(sar16(cpu, LDLCKM(), 1)); }
 
-	u16  x = a;
-	bool c = cpu->flags.c;
+static void op_rolbr(CPU) { LOCKR1MB(); STLCKM(rol8(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_rorbr(CPU) { LOCKR1MB(); STLCKM(ror8(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_rclbr(CPU) { LOCKR1MB(); STLCKM(rcl8(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_rcrbr(CPU) { LOCKR1MB(); STLCKM(rcr8(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_shlbr(CPU) { LOCKR1MB(); STLCKM(shl8(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_shrbr(CPU) { LOCKR1MB(); STLCKM(shr8(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_salbr(CPU) { LOCKR1MB(); STLCKM(sal8(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_sarbr(CPU) { LOCKR1MB(); STLCKM(sar8(cpu, LDLCKM(), cpu->regs.cx.l)); }
 
-	switch (b) {
+static void op_rolwr(CPU) { LOCKR1MW(); STLCKM(rol16(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_rorwr(CPU) { LOCKR1MW(); STLCKM(ror16(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_rclwr(CPU) { LOCKR1MW(); STLCKM(rcl16(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_rcrwr(CPU) { LOCKR1MW(); STLCKM(rcr16(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_shlwr(CPU) { LOCKR1MW(); STLCKM(shl16(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_shrwr(CPU) { LOCKR1MW(); STLCKM(shr16(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_salwr(CPU) { LOCKR1MW(); STLCKM(sal16(cpu, LDLCKM(), cpu->regs.cx.l)); }
+static void op_sarwr(CPU) { LOCKR1MW(); STLCKM(sar16(cpu, LDLCKM(), cpu->regs.cx.l)); }
 
-		case 15: c = sign(x, 0x0001); x = sarw(x);
-		case 14: c = sign(x, 0x0001); x = sarw(x);
-		case 13: c = sign(x, 0x0001); x = sarw(x);
-		case 12: c = sign(x, 0x0001); x = sarw(x);
-		case 11: c = sign(x, 0x0001); x = sarw(x);
-		case 10: c = sign(x, 0x0001); x = sarw(x);
-		case  9: c = sign(x, 0x0001); x = sarw(x);
-		case  8: c = sign(x, 0x0001); x = sarw(x);
-		case  7: c = sign(x, 0x0001); x = sarw(x);
-		case  6: c = sign(x, 0x0001); x = sarw(x);
-		case  5: c = sign(x, 0x0001); x = sarw(x);
-		case  4: c = sign(x, 0x0001); x = sarw(x);
-		case  3: c = sign(x, 0x0001); x = sarw(x);
-		case  2: c = sign(x, 0x0001); x = sarw(x);
-		case  1: c = sign(x, 0x0001); x = sarw(x);
-		case  0: goto done;
+static void op_movambf(CPU) { cpu->insn.addr += LDIPUW(); cpu->regs.ax.l = LDEAMB(0); }
+static void op_movamwf(CPU) { cpu->insn.addr += LDIPUW(); cpu->regs.ax.w = LDEAMW(0); }
 
-		default:
-			x = sign(x, 0x8000)? 0xffff: 0;
+static void op_movambr(CPU) { cpu->insn.addr += LDIPUW(); STMB(cpu->insn.segment, cpu->insn.addr, cpu->regs.ax.l); }
+static void op_movamwr(CPU) { cpu->insn.addr += LDIPUW(); STMW(cpu->insn.segment, cpu->insn.addr, cpu->regs.ax.w); }
 
-	}
+static void op_movrib(CPU)  { *cpu->insn.reg0b = LDIPUB(); }
+static void op_movriw(CPU)  { *cpu->insn.reg0w = LDIPUW(); }
 
-done:
-	if (v) {
+static void op_movrmib(CPU) { const u8  imm = LDIPUB(); STEAR1MB(imm); }
+static void op_movrmiw(CPU) { const u16 imm = LDIPUW(); STEAR1MW(imm); }
 
-		cpu->flags.c = c;
-		cpu->flags.v = sign(x, 0x8000) ^ sign(x, 0x4000);
+static void op_movrrmbf(CPU) { *cpu->insn.reg0b = LDEAR1MB(); }
+static void op_movrrmwf(CPU) { *cpu->insn.reg0w = LDEAR1MW(); }
 
-	}
+static void op_movsrmwf(CPU) { memselect(cpu, (uint)cpu->insn.reg0w, LDEAR1MW()); cpu->interrupt.delay = true; }
 
-	if (b > 0) {
+static void op_movrrmbr(CPU) { STEAR1MB(*cpu->insn.reg0b); }
+static void op_movrrmwr(CPU) { STEAR1MW(*cpu->insn.reg0w); }
 
-		cpu->flags.p = parity(x);
-		cpu->flags.a = false;
-		cpu->flags.z = zero(x, 0x8000);
-		cpu->flags.s = sign(x, 0x8000);
+static void op_movsrmwr(CPU) { STEAR1MW(SEGMENT((uint)cpu->insn.reg0w)); }
 
-	}
+static void op_cbw(CPU) { cpu->regs.ax.w = (i8)cpu->regs.ax.l; }
+static void op_cwd(CPU) { cpu->regs.dx.w = sign(cpu->regs.ax.w, 16)? 0xffff: 0x0000; }
 
-	return x;
+static void op_lahf(CPU) { cpu->regs.ax.h = getf_w(cpu); }
+static void op_sahf(CPU) { setf_lb(cpu, cpu->regs.ax.h); }
 
-}
+static void op_xcharw(CPU) { ureg tmp = cpu->regs.ax.w; cpu->regs.ax.w = *cpu->insn.reg0w; *cpu->insn.reg0w = tmp; }
 
+static void op_xchrmb(CPU) { LOCKR1MB(); ureg tmp = LDLCKM(); STLCKM(*cpu->insn.reg0b); *cpu->insn.reg0b = tmp; }
+static void op_xchrmw(CPU) { LOCKR1MW(); ureg tmp = LDLCKM(); STLCKM(*cpu->insn.reg0w); *cpu->insn.reg0w = tmp; }
 
-void op_addaib(CPU) { cpu->regs.ax.l = add8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_ioraib(CPU) { cpu->regs.ax.l = ior8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_adcaib(CPU) { cpu->regs.ax.l = adc8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_sbbaib(CPU) { cpu->regs.ax.l = sbb8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_andaib(CPU) { cpu->regs.ax.l = and8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_subaib(CPU) { cpu->regs.ax.l = sub8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_xoraib(CPU) { cpu->regs.ax.l = xor8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_cmpaib(CPU) {                  sub8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
+static void op_tstaib(CPU) { const u8  imm = LDIPUB(); and8( cpu, cpu->regs.ax.l, imm); }
+static void op_tstaiw(CPU) { const u16 imm = LDIPUW(); and16(cpu, cpu->regs.ax.w, imm); }
 
-void op_addaiw(CPU) { cpu->regs.ax.w = add16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-void op_ioraiw(CPU) { cpu->regs.ax.w = ior16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-void op_adcaiw(CPU) { cpu->regs.ax.w = adc16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-void op_sbbaiw(CPU) { cpu->regs.ax.w = sbb16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-void op_andaiw(CPU) { cpu->regs.ax.w = and16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-void op_subaiw(CPU) { cpu->regs.ax.w = sub16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-void op_xoraiw(CPU) { cpu->regs.ax.w = xor16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-void op_cmpaiw(CPU) {                  sub16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
+static void op_tstrib(CPU) { const u8  imm = LDIPUB(); ureg tmp = LDEAR1MB(); and8( cpu, tmp, imm); }
+static void op_tstriw(CPU) { const u16 imm = LDIPUW(); ureg tmp = LDEAR1MW(); and16(cpu, tmp, imm); }
 
-void op_addrmib(CPU) { aluu tmp = LDEAR1MB(); tmp = add8(cpu, tmp, (u8)cpu->insn.imm1); STEAR1MB(tmp); }
-void op_iorrmib(CPU) { aluu tmp = LDEAR1MB(); tmp = ior8(cpu, tmp, (u8)cpu->insn.imm1); STEAR1MB(tmp); }
-void op_adcrmib(CPU) { aluu tmp = LDEAR1MB(); tmp = adc8(cpu, tmp, (u8)cpu->insn.imm1); STEAR1MB(tmp); }
-void op_sbbrmib(CPU) { aluu tmp = LDEAR1MB(); tmp = sbb8(cpu, tmp, (u8)cpu->insn.imm1); STEAR1MB(tmp); }
-void op_andrmib(CPU) { aluu tmp = LDEAR1MB(); tmp = and8(cpu, tmp, (u8)cpu->insn.imm1); STEAR1MB(tmp); }
-void op_subrmib(CPU) { aluu tmp = LDEAR1MB(); tmp = sub8(cpu, tmp, (u8)cpu->insn.imm1); STEAR1MB(tmp); }
-void op_xorrmib(CPU) { aluu tmp = LDEAR1MB(); tmp = xor8(cpu, tmp, (u8)cpu->insn.imm1); STEAR1MB(tmp); }
-void op_cmprmib(CPU) { aluu tmp = LDEAR1MB();       sub8(cpu, tmp, (u8)cpu->insn.imm1); }
+static void op_tstrmb(CPU) { ureg tmp = LDEAR1MB(); and8( cpu, tmp, *cpu->insn.reg0b); }
+static void op_tstrmw(CPU) { ureg tmp = LDEAR1MW(); and16(cpu, tmp, *cpu->insn.reg0w); }
 
-void op_addrmiw(CPU) { aluu tmp = LDEAR1MW(); tmp = add16(cpu, tmp, (u16)cpu->insn.imm1); STEAR1MW(tmp); }
-void op_iorrmiw(CPU) { aluu tmp = LDEAR1MW(); tmp = ior16(cpu, tmp, (u16)cpu->insn.imm1); STEAR1MW(tmp); }
-void op_adcrmiw(CPU) { aluu tmp = LDEAR1MW(); tmp = adc16(cpu, tmp, (u16)cpu->insn.imm1); STEAR1MW(tmp); }
-void op_sbbrmiw(CPU) { aluu tmp = LDEAR1MW(); tmp = sbb16(cpu, tmp, (u16)cpu->insn.imm1); STEAR1MW(tmp); }
-void op_andrmiw(CPU) { aluu tmp = LDEAR1MW(); tmp = and16(cpu, tmp, (u16)cpu->insn.imm1); STEAR1MW(tmp); }
-void op_subrmiw(CPU) { aluu tmp = LDEAR1MW(); tmp = sub16(cpu, tmp, (u16)cpu->insn.imm1); STEAR1MW(tmp); }
-void op_xorrmiw(CPU) { aluu tmp = LDEAR1MW(); tmp = xor16(cpu, tmp, (u16)cpu->insn.imm1); STEAR1MW(tmp); }
-void op_cmprmiw(CPU) { aluu tmp = LDEAR1MW();       sub16(cpu, tmp, (u16)cpu->insn.imm1); }
+static void op_ldsr(CPU) { MEMONLY(); *cpu->insn.reg0w = LDEAMW(0); memselect(cpu, REG_DS, LDEAMW(2)); }
+static void op_lesr(CPU) { MEMONLY(); *cpu->insn.reg0w = LDEAMW(0); memselect(cpu, REG_ES, LDEAMW(2)); }
+static void op_lear(CPU) { MEMONLY(); *cpu->insn.reg0w = cpu->insn.addr; }
 
-void op_addrmbf(CPU) { aluu tmp = LDEAR1MB(); *cpu->insn.reg0b = add8(cpu, *cpu->insn.reg0b, tmp); }
-void op_iorrmbf(CPU) { aluu tmp = LDEAR1MB(); *cpu->insn.reg0b = ior8(cpu, *cpu->insn.reg0b, tmp); }
-void op_adcrmbf(CPU) { aluu tmp = LDEAR1MB(); *cpu->insn.reg0b = adc8(cpu, *cpu->insn.reg0b, tmp); }
-void op_sbbrmbf(CPU) { aluu tmp = LDEAR1MB(); *cpu->insn.reg0b = sbb8(cpu, *cpu->insn.reg0b, tmp); }
-void op_andrmbf(CPU) { aluu tmp = LDEAR1MB(); *cpu->insn.reg0b = and8(cpu, *cpu->insn.reg0b, tmp); }
-void op_subrmbf(CPU) { aluu tmp = LDEAR1MB(); *cpu->insn.reg0b = sub8(cpu, *cpu->insn.reg0b, tmp); }
-void op_xorrmbf(CPU) { aluu tmp = LDEAR1MB(); *cpu->insn.reg0b = xor8(cpu, *cpu->insn.reg0b, tmp); }
-void op_cmprmbf(CPU) { aluu tmp = LDEAR1MB();                    sub8(cpu, *cpu->insn.reg0b, tmp); }
+static void op_xlatab(CPU) { cpu->regs.ax.l = LDMB(cpu->insn.segment, cpu->regs.bx.w + cpu->regs.ax.l); }
 
-void op_addrmwf(CPU) { aluu tmp = LDEAR1MW(); *cpu->insn.reg0w = add16(cpu, *cpu->insn.reg0w, tmp); }
-void op_iorrmwf(CPU) { aluu tmp = LDEAR1MW(); *cpu->insn.reg0w = ior16(cpu, *cpu->insn.reg0w, tmp); }
-void op_adcrmwf(CPU) { aluu tmp = LDEAR1MW(); *cpu->insn.reg0w = adc16(cpu, *cpu->insn.reg0w, tmp); }
-void op_sbbrmwf(CPU) { aluu tmp = LDEAR1MW(); *cpu->insn.reg0w = sbb16(cpu, *cpu->insn.reg0w, tmp); }
-void op_andrmwf(CPU) { aluu tmp = LDEAR1MW(); *cpu->insn.reg0w = and16(cpu, *cpu->insn.reg0w, tmp); }
-void op_subrmwf(CPU) { aluu tmp = LDEAR1MW(); *cpu->insn.reg0w = sub16(cpu, *cpu->insn.reg0w, tmp); }
-void op_xorrmwf(CPU) { aluu tmp = LDEAR1MW(); *cpu->insn.reg0w = xor16(cpu, *cpu->insn.reg0w, tmp); }
-void op_cmprmwf(CPU) { aluu tmp = LDEAR1MW();                    sub16(cpu, *cpu->insn.reg0w, tmp); }
+static void op_popcs( CPU) { ADVSP(+2); memselect(cpu, REG_CS, LDSPW(-2)); }
+static void op_popds( CPU) { ADVSP(+2); memselect(cpu, REG_DS, LDSPW(-2)); }
+static void op_popes( CPU) { ADVSP(+2); memselect(cpu, REG_ES, LDSPW(-2)); }
+static void op_popss( CPU) { ADVSP(+2); memselect(cpu, REG_SS, LDSPW(-2)); cpu->interrupt.delay = true; }
+static void op_poprw( CPU) { ADVSP(+2); *cpu->insn.reg0w = LDSPW(-2); }
+static void op_popfw( CPU) { ADVSP(+2); setf_w(cpu, LDSPW(-2)); }
 
-void op_addrmbr(CPU) { aluu tmp = LDEAR1MB(); tmp = add8(cpu, tmp, *cpu->insn.reg0b); STEAR1MB(tmp); }
-void op_iorrmbr(CPU) { aluu tmp = LDEAR1MB(); tmp = ior8(cpu, tmp, *cpu->insn.reg0b); STEAR1MB(tmp); }
-void op_adcrmbr(CPU) { aluu tmp = LDEAR1MB(); tmp = adc8(cpu, tmp, *cpu->insn.reg0b); STEAR1MB(tmp); }
-void op_sbbrmbr(CPU) { aluu tmp = LDEAR1MB(); tmp = sbb8(cpu, tmp, *cpu->insn.reg0b); STEAR1MB(tmp); }
-void op_andrmbr(CPU) { aluu tmp = LDEAR1MB(); tmp = and8(cpu, tmp, *cpu->insn.reg0b); STEAR1MB(tmp); }
-void op_subrmbr(CPU) { aluu tmp = LDEAR1MB(); tmp = sub8(cpu, tmp, *cpu->insn.reg0b); STEAR1MB(tmp); }
-void op_xorrmbr(CPU) { aluu tmp = LDEAR1MB(); tmp = xor8(cpu, tmp, *cpu->insn.reg0b); STEAR1MB(tmp); }
-void op_cmprmbr(CPU) { aluu tmp = LDEAR1MB();       sub8(cpu, tmp, *cpu->insn.reg0b); }
+static void op_pushcs(CPU) { ADVSP(-2); STSPW(0, SEGMENT(REG_CS)); }
+static void op_pushds(CPU) { ADVSP(-2); STSPW(0, SEGMENT(REG_DS)); }
+static void op_pushes(CPU) { ADVSP(-2); STSPW(0, SEGMENT(REG_ES)); }
+static void op_pushss(CPU) { ADVSP(-2); STSPW(0, SEGMENT(REG_SS)); }
+static void op_pushsp(CPU) { ADVSP(-2); STSPW(0, cpu->regs.sp.w); }
+static void op_pushrw(CPU) { ADVSP(-2); STSPW(0, *cpu->insn.reg0w); }
+static void op_pushfw(CPU) { ADVSP(-2); STSPW(0, getf_w(cpu)); }
 
-void op_addrmwr(CPU) { aluu tmp = LDEAR1MW(); tmp = add16(cpu, tmp, *cpu->insn.reg0w); STEAR1MW(tmp); }
-void op_iorrmwr(CPU) { aluu tmp = LDEAR1MW(); tmp = ior16(cpu, tmp, *cpu->insn.reg0w); STEAR1MW(tmp); }
-void op_adcrmwr(CPU) { aluu tmp = LDEAR1MW(); tmp = adc16(cpu, tmp, *cpu->insn.reg0w); STEAR1MW(tmp); }
-void op_sbbrmwr(CPU) { aluu tmp = LDEAR1MW(); tmp = sbb16(cpu, tmp, *cpu->insn.reg0w); STEAR1MW(tmp); }
-void op_andrmwr(CPU) { aluu tmp = LDEAR1MW(); tmp = and16(cpu, tmp, *cpu->insn.reg0w); STEAR1MW(tmp); }
-void op_subrmwr(CPU) { aluu tmp = LDEAR1MW(); tmp = sub16(cpu, tmp, *cpu->insn.reg0w); STEAR1MW(tmp); }
-void op_xorrmwr(CPU) { aluu tmp = LDEAR1MW(); tmp = xor16(cpu, tmp, *cpu->insn.reg0w); STEAR1MW(tmp); }
-void op_cmprmwr(CPU) { aluu tmp = LDEAR1MW();       sub16(cpu, tmp, *cpu->insn.reg0w); }
+static void op_poprmw(CPU)  { ADVSP(+2); ureg tmp = LDSPW(-2);  STEAR1MW(tmp); }
+static void op_pushrmw(CPU) { ADVSP(-2); ureg tmp = LDEAR1MW(); STSPW(0, tmp); }
 
-void op_decrmb(CPU) { aluu tmp = LDEAR1MB(); tmp = dec8(cpu, tmp); STEAR1MB(tmp); }
-void op_incrmb(CPU) { aluu tmp = LDEAR1MB(); tmp = inc8(cpu, tmp); STEAR1MB(tmp); }
+static void op_callf(CPU) { const u16 tip = LDIPUW(), tcs = LDIPUW(); ADVSP(-4); STSPW(2, SEGMENT(REG_CS)); STSPW(0, cpu->regs.ip); cpu->regs.ip  = tip; SEGMENT(REG_CS) = tcs; }
+static void op_calln(CPU) { const i16 imm = LDIPSW();                 ADVSP(-2); STSPW(0, cpu->regs.ip);                         cpu->regs.ip += imm; }
+static void op_callfrm(CPU) { MEMONLY(); ureg tip = LDEAMW(0); ureg tcs = LDEAMW(2); ADVSP(-4); STSPW(2, SEGMENT(REG_CS)); STSPW(0, cpu->regs.ip); cpu->regs.ip = tip; SEGMENT(REG_CS) = tcs; }
+static void op_callnrm(CPU) { ureg tmp = LDEAR1MW(); ADVSP(-2); STSPW(0, cpu->regs.ip); cpu->regs.ip = tmp; }
 
-void op_decrmw(CPU) { aluu tmp = LDEAR1MW(); tmp = dec16(cpu, tmp); STEAR1MW(tmp); }
-void op_incrmw(CPU) { aluu tmp = LDEAR1MW(); tmp = inc16(cpu, tmp); STEAR1MW(tmp); }
+static void op_int3(CPU)  {                          interrupt(cpu, I8086_VECTOR_BREAK, SEGMENT(REG_CS), cpu->regs.ip); }
+static void op_into(CPU)  { if (cpu->flags.v)        interrupt(cpu, I8086_VECTOR_VFLOW, SEGMENT(REG_CS), cpu->regs.ip); }
+static void op_intib(CPU) { const u8 imm = LDIPUB(); interrupt(cpu, imm, SEGMENT(REG_CS), cpu->regs.ip); }
+static void op_iret(CPU)  { ADVSP(+4); cpu->regs.ip = LDSPW(-4); memselect(cpu, REG_CS, LDSPW(-2)); op_popfw(cpu); cpu->interrupt.delay = true; }
 
-void op_decrw(CPU) { *cpu->insn.reg0w = dec16(cpu, *cpu->insn.reg0w); }
-void op_incrw(CPU) { *cpu->insn.reg0w = inc16(cpu, *cpu->insn.reg0w); }
+static void op_jcbe(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.c                 || cpu->flags.z) cpu->regs.ip += imm; }
+static void op_jcle(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.s != cpu->flags.v || cpu->flags.z) cpu->regs.ip += imm; }
+static void op_jcl(CPU)  { const i8 imm = LDIPSB(); if (cpu->flags.s != cpu->flags.v)                 cpu->regs.ip += imm; }
 
-void op_rolb1(CPU) { aluu tmp = LDEAR1MB(); tmp = rol8(cpu, tmp, 1, true); STEAR1MB(tmp); }
-void op_rorb1(CPU) { aluu tmp = LDEAR1MB(); tmp = ror8(cpu, tmp, 1, true); STEAR1MB(tmp); }
-void op_rclb1(CPU) { aluu tmp = LDEAR1MB(); tmp = rcl8(cpu, tmp, 1, true); STEAR1MB(tmp); }
-void op_rcrb1(CPU) { aluu tmp = LDEAR1MB(); tmp = rcr8(cpu, tmp, 1, true); STEAR1MB(tmp); }
-void op_shlb1(CPU) { aluu tmp = LDEAR1MB(); tmp = shl8(cpu, tmp, 1, true); STEAR1MB(tmp); }
-void op_shrb1(CPU) { aluu tmp = LDEAR1MB(); tmp = shr8(cpu, tmp, 1, true); STEAR1MB(tmp); }
-void op_salb1(CPU) { aluu tmp = LDEAR1MB(); tmp = sal8(cpu, tmp, 1, true); STEAR1MB(tmp); }
-void op_sarb1(CPU) { aluu tmp = LDEAR1MB(); tmp = sar8(cpu, tmp, 1, true); STEAR1MB(tmp); }
+static void op_jcc(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.c) cpu->regs.ip += imm; }
+static void op_jco(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.v) cpu->regs.ip += imm; }
+static void op_jcp(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.p) cpu->regs.ip += imm; }
+static void op_jcs(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.s) cpu->regs.ip += imm; }
+static void op_jcz(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.z) cpu->regs.ip += imm; }
 
-void op_rolw1(CPU) { aluu tmp = LDEAR1MW(); tmp = rol16(cpu, tmp, 1, true); STEAR1MW(tmp); }
-void op_rorw1(CPU) { aluu tmp = LDEAR1MW(); tmp = ror16(cpu, tmp, 1, true); STEAR1MW(tmp); }
-void op_rclw1(CPU) { aluu tmp = LDEAR1MW(); tmp = rcl16(cpu, tmp, 1, true); STEAR1MW(tmp); }
-void op_rcrw1(CPU) { aluu tmp = LDEAR1MW(); tmp = rcr16(cpu, tmp, 1, true); STEAR1MW(tmp); }
-void op_shlw1(CPU) { aluu tmp = LDEAR1MW(); tmp = shl16(cpu, tmp, 1, true); STEAR1MW(tmp); }
-void op_shrw1(CPU) { aluu tmp = LDEAR1MW(); tmp = shr16(cpu, tmp, 1, true); STEAR1MW(tmp); }
-void op_salw1(CPU) { aluu tmp = LDEAR1MW(); tmp = sal16(cpu, tmp, 1, true); STEAR1MW(tmp); }
-void op_sarw1(CPU) { aluu tmp = LDEAR1MW(); tmp = sar16(cpu, tmp, 1, true); STEAR1MW(tmp); }
+static void op_jcnbe(CPU) { const i8 imm = LDIPSB(); if (!cpu->flags.c                && !cpu->flags.z) cpu->regs.ip += imm; }
+static void op_jcnle(CPU) { const i8 imm = LDIPSB(); if (cpu->flags.s == cpu->flags.v && !cpu->flags.z) cpu->regs.ip += imm; }
+static void op_jcnl(CPU)  { const i8 imm = LDIPSB(); if (cpu->flags.s == cpu->flags.v)                  cpu->regs.ip += imm; }
 
-void op_rolbr(CPU) { aluu tmp = LDEAR1MB(); tmp = rol8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
-void op_rorbr(CPU) { aluu tmp = LDEAR1MB(); tmp = ror8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
-void op_rclbr(CPU) { aluu tmp = LDEAR1MB(); tmp = rcl8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
-void op_rcrbr(CPU) { aluu tmp = LDEAR1MB(); tmp = rcr8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
-void op_shlbr(CPU) { aluu tmp = LDEAR1MB(); tmp = shl8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
-void op_shrbr(CPU) { aluu tmp = LDEAR1MB(); tmp = shr8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
-void op_salbr(CPU) { aluu tmp = LDEAR1MB(); tmp = sal8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
-void op_sarbr(CPU) { aluu tmp = LDEAR1MB(); tmp = sar8(cpu, tmp, cpu->regs.cx.l, false); STEAR1MB(tmp); }
+static void op_jcnc(CPU) { const i8 imm = LDIPSB(); if (!cpu->flags.c) cpu->regs.ip += imm; }
+static void op_jcno(CPU) { const i8 imm = LDIPSB(); if (!cpu->flags.v) cpu->regs.ip += imm; }
+static void op_jcnp(CPU) { const i8 imm = LDIPSB(); if (!cpu->flags.p) cpu->regs.ip += imm; }
+static void op_jcns(CPU) { const i8 imm = LDIPSB(); if (!cpu->flags.s) cpu->regs.ip += imm; }
+static void op_jcnz(CPU) { const i8 imm = LDIPSB(); if (!cpu->flags.z) cpu->regs.ip += imm; }
 
-void op_rolwr(CPU) { aluu tmp = LDEAR1MW(); tmp = rol16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
-void op_rorwr(CPU) { aluu tmp = LDEAR1MW(); tmp = ror16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
-void op_rclwr(CPU) { aluu tmp = LDEAR1MW(); tmp = rcl16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
-void op_rcrwr(CPU) { aluu tmp = LDEAR1MW(); tmp = rcr16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
-void op_shlwr(CPU) { aluu tmp = LDEAR1MW(); tmp = shl16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
-void op_shrwr(CPU) { aluu tmp = LDEAR1MW(); tmp = shr16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
-void op_salwr(CPU) { aluu tmp = LDEAR1MW(); tmp = sal16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
-void op_sarwr(CPU) { aluu tmp = LDEAR1MW(); tmp = sar16(cpu, tmp, cpu->regs.cx.l, false); STEAR1MW(tmp); }
+static void op_jcxzr(CPU) { const i8 imm = LDIPSB(); if (!cpu->regs.cx.w)  cpu->regs.ip += imm; }
 
-void op_movambf(CPU) { cpu->regs.ax.l = bus_read8( &cpu->mem, cpu->insn.addr); }
-void op_movamwf(CPU) { cpu->regs.ax.w = bus_read16(&cpu->mem, cpu->insn.addr); }
+static void op_jmpf(CPU)  { const u16 tip = LDIPUW(); memselect(cpu, REG_CS, LDIPUW()); cpu->regs.ip = tip; }
+static void op_jmpnw(CPU) { const i16 imm = LDIPSW(); cpu->regs.ip += imm; }
+static void op_jmpnb(CPU) { const i8  imm = LDIPSB(); cpu->regs.ip += imm; }
+static void op_jmpfrm(CPU) { MEMONLY(); cpu->regs.ip = LDEAMW(0); memselect(cpu, REG_CS, LDEAMW(2)); }
+static void op_jmpnrm(CPU) { cpu->regs.ip = LDEAR1MW(); }
 
-void op_movambr(CPU) { bus_write8( &cpu->mem, cpu->insn.addr, cpu->regs.ax.l); }
-void op_movamwr(CPU) { bus_write16(&cpu->mem, cpu->insn.addr, cpu->regs.ax.w); }
+static void op_loopnzr(CPU) { const i8 imm = LDIPSB(); if (--cpu->regs.cx.w && !cpu->flags.z) cpu->regs.ip += imm; }
+static void op_loopzr(CPU)  { const i8 imm = LDIPSB(); if (--cpu->regs.cx.w && cpu->flags.z)  cpu->regs.ip += imm; }
+static void op_loopr(CPU)   { const i8 imm = LDIPSB(); if (--cpu->regs.cx.w)                  cpu->regs.ip += imm; }
 
-void op_movrib(CPU)  { *cpu->insn.reg0b = cpu->insn.imm0; }
-void op_movriw(CPU)  { *cpu->insn.reg0w = cpu->insn.imm0; }
+static void op_retf0(CPU) { ADVSP(+4); cpu->regs.ip = LDSPW(-4); memselect(cpu, REG_CS, LDSPW(-2)); }
+static void op_retn0(CPU) {                           ADVSP(+2); cpu->regs.ip = LDSPW(-2); }
 
-void op_movrmib(CPU) { STEAR1MB(cpu->insn.imm1); }
-void op_movrmiw(CPU) { STEAR1MW(cpu->insn.imm1); }
+static void op_retfw(CPU) { const u16 imm = LDIPUW(); op_retf0(cpu); ADVSP(imm); }
+static void op_retnw(CPU) { const u16 imm = LDIPUW(); op_retn0(cpu); ADVSP(imm); }
 
-void op_movrrmbf(CPU) { *cpu->insn.reg0b = LDEAR1MB(); }
-void op_movrrmbr(CPU) { STEAR1MB(*cpu->insn.reg0b);}
+static void op_inib(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.l = io_readb(&cpu->iob, imm); }
+static void op_iniw(CPU) { const u8 imm = LDIPUB(); cpu->regs.ax.w = io_readw(&cpu->iow, imm); }
+static void op_inrb(CPU) { cpu->regs.ax.l = io_readb(&cpu->iob, cpu->regs.dx.w); }
+static void op_inrw(CPU) { cpu->regs.ax.w = io_readw(&cpu->iow, cpu->regs.dx.w); }
 
-void op_movrrmwf(CPU) { *cpu->insn.reg0w = LDEAR1MW(); }
-void op_movrrmwr(CPU) { STEAR1MW(*cpu->insn.reg0w); }
+static void op_outib(CPU) { const u8 imm = LDIPUB(); io_writeb(&cpu->iob, imm, cpu->regs.ax.l); }
+static void op_outiw(CPU) { const u8 imm = LDIPUB(); io_writew(&cpu->iow, imm, cpu->regs.ax.w); }
+static void op_outrb(CPU) { io_writeb(&cpu->iob, cpu->regs.dx.w, cpu->regs.ax.l); }
+static void op_outrw(CPU) { io_writew(&cpu->iow, cpu->regs.dx.w, cpu->regs.ax.w); }
 
+static void op_seges(CPU) { cpu->insn.segment = REG_ES; }
+static void op_segcs(CPU) { cpu->insn.segment = REG_CS; }
+static void op_segss(CPU) { cpu->insn.segment = REG_SS; }
+static void op_segds(CPU) { cpu->insn.segment = REG_DS; }
+static void op_repne(CPU) { cpu->insn.repeat_eq = false; cpu->insn.repeat_ne = true;  }
+static void op_repeq(CPU) { cpu->insn.repeat_eq = true;  cpu->insn.repeat_ne = false; }
 
+static void op_lock(CPU) { /* FIXME: Not implemented */ }
+static void op_wait(CPU) { /* FIXME: Not implemented */ }
+
+static void op_clc(CPU) { cpu->flags.c = false; }
+static void op_stc(CPU) { cpu->flags.c = true;  }
+static void op_cli(CPU) { cpu->flags.i = false; }
+static void op_cmc(CPU) { cpu->flags.c = !cpu->flags.c; }
+static void op_sti(CPU) { cpu->flags.i = true;  }
+static void op_cld(CPU) { cpu->flags.d = false; }
+static void op_std(CPU) { cpu->flags.d = true;  }
 
 static void op_divrmb(CPU);
 static void op_divrmw(CPU);
-
-static void op_idivrmb(CPU);
-static void op_idivrmw(CPU);
-
-static void op_imulrmb(CPU);
-static void op_imulrmw(CPU);
-
 static void op_mulrmb(CPU);
 static void op_mulrmw(CPU);
 
-static void op_negrmb(CPU);
-static void op_negrmw(CPU);
+static void op_idivrmb(CPU);
+static void op_idivrmw(CPU);
+static void op_imulrmb(CPU);
+static void op_imulrmw(CPU);
 
-static void op_notrmb(CPU);
-static void op_notrmw(CPU);
-
-static void op_tstaib(CPU);
-static void op_tstaiw(CPU);
-static void op_tstrib(CPU);
-static void op_tstriw(CPU);
-static void op_tstrmb(CPU);
-static void op_tstrmw(CPU);
-
-
-static void op_aaa(CPU);      // Conversions
+static void op_aaa(CPU);      // BCD
 static void op_aad(CPU);
 static void op_aas(CPU);
 static void op_aam(CPU);
-static void op_cbw(CPU);
-static void op_cwd(CPU);
 static void op_daa(CPU);
 static void op_das(CPU);
-
-static void op_lahf(CPU);     // Load and store
-static void op_ldsr(CPU);
-static void op_lesr(CPU);
-static void op_lear(CPU);
-static void op_sahf(CPU);
-static void op_xcharw(CPU);
-static void op_xchrmb(CPU);
-static void op_xchrmw(CPU);
-static void op_xlatab(CPU);
-
-static void op_popcs( CPU);   // Stack
-static void op_popds( CPU);
-static void op_popes( CPU);
-static void op_popss( CPU);
-static void op_popfw( CPU);
-static void op_poprmw(CPU);
-static void op_poprw( CPU);
-static void op_pushcs(CPU);
-static void op_pushds(CPU);
-static void op_pushes(CPU);
-static void op_pushss(CPU);
-static void op_pushsp(CPU);
-static void op_pushfw(CPU);
-static void op_pushrmw(CPU);
-static void op_pushrw(CPU);
-
-static void op_callf(CPU);   // Flow control
-static void op_calln(CPU);
-static void op_callfrm(CPU);
-static void op_callnrm(CPU);
-static void op_int3(CPU);
-static void op_intib(CPU);
-static void op_into(CPU);
-static void op_iret(CPU);
-static void op_jcbe(CPU);
-static void op_jcle(CPU);
-static void op_jcc(CPU);
-static void op_jcl(CPU);
-static void op_jco(CPU);
-static void op_jcp(CPU);
-static void op_jcs(CPU);
-static void op_jcz(CPU);
-static void op_jcnbe(CPU);
-static void op_jcnle(CPU);
-static void op_jcnc(CPU);
-static void op_jcnl(CPU);
-static void op_jcno(CPU);
-static void op_jcnp(CPU);
-static void op_jcns(CPU);
-static void op_jcnz(CPU);
-static void op_jcxzr(CPU);
-static void op_jmpf(CPU);
-static void op_jmpfrm(CPU);
-static void op_jmpn(CPU);
-static void op_jmpnrm(CPU);
-static void op_loopnzr(CPU);
-static void op_loopzr(CPU);
-static void op_loopr(CPU);
-static void op_retf(CPU);
-static void op_retn(CPU);
-
-static void op_inib(CPU);    // I/O
-static void op_iniw(CPU);
-static void op_inrb(CPU);
-static void op_inrw(CPU);
-static void op_outib(CPU);
-static void op_outiw(CPU);
-static void op_outrb(CPU);
-static void op_outrw(CPU);
-
-static void op_segcs(CPU);   // Overrides
-static void op_segds(CPU);
-static void op_seges(CPU);
-static void op_segss(CPU);
-
-static void op_repne(CPU);
-static void op_repeq(CPU);
-
-static void op_lock(CPU);
-static void op_wait(CPU);
-
-static void op_clc(CPU);     // Flags
-static void op_cld(CPU);
-static void op_cli(CPU);
-static void op_cmc(CPU);
-static void op_stc(CPU);
-static void op_std(CPU);
-static void op_sti(CPU);
 
 static void op_cmpsb(CPU);   // String
 static void op_cmpsw(CPU);
@@ -1134,120 +853,57 @@ static void op_scasw(CPU);
 static void op_stosb(CPU);
 static void op_stosw(CPU);
 
-static void op_undef(CPU);   // Invalid
-static void op_group(CPU);
-static void op_nop(CPU);
 
-
-typedef void (*opcode)(CPU);
-
-enum {
-
-	OP_MODRM  = 1 << 8,  // Requires MODRM
-	OP_W8     = 0 << 9,  // Is 8-bit operation
-	OP_W16    = 1 << 9,  // Is 16-bit operation
-	OP_RSEG   = 1 << 11, // REG in MODRM is segment register
-	OP_GROUP  = 1 << 12, // Group opcode, REG field of MODRM is operation
-	OP_EAIMM0 = 1 << 13, // Use first immediate operand to compute effective address
-	OP_EASEG  = 1 << 14, // Use segment to compute effective address
-	OP_NEASEG = 1 << 15, // Don't use segment to compute effective address
-	OP_OVRD   = 1 << 16, // Opcode is override, keep flags
-	OP_R02    = 1 << 17, // Lowest 3 bits of opcode is register
-	OP_I0B    = 1 << 18, // Requires first sign-extended 8bit immediate operand
-	OP_I0W    = 1 << 19, // Requires first 16bit immediate operand
-	OP_I1B    = 1 << 20, // Requires first sign-extended 8bit immediate operand
-	OP_I1W    = 1 << 21, // Requires first 16bit immediate operand
-
-	OP_RMB   = OP_MODRM | OP_W8,
-	OP_RMW   = OP_MODRM | OP_W16,
-	OP_R02B  = OP_R02   | OP_W8,
-	OP_R02W  = OP_R02   | OP_W16,
-	OP_ADRF  = OP_I0W   | OP_I1W,
-	OP_ADRN  = OP_I0W,
-	OP_ADRR  = OP_I0B,
-
-	OP_RIBB = OP_I0B | OP_W8,
-	OP_RIWB = OP_I0W | OP_W8,
-
-	OP_RIBW = OP_I0B | OP_W16,
-	OP_RIWW = OP_I0W | OP_W16,
-
-	OP_RMIB = OP_MODRM | OP_I1B | OP_W8,
-	OP_RMIW = OP_MODRM | OP_I1W | OP_W16,
-
-	OP_R2IB = OP_R02   | OP_W8  | OP_I0B,
-	OP_R2IW = OP_R02   | OP_W16 | OP_I0W,
-	OP_SMB  = OP_MODRM | OP_W16 | OP_RSEG,
-
-	OP_RANB = OP_EASEG | OP_EAIMM0 | OP_I0W | OP_W8,
-	OP_RANW = OP_EASEG | OP_EAIMM0 | OP_I0W | OP_W16,
-
-	OP_G0  =  0 | OP_RMB | OP_GROUP | OP_I1B,
-	OP_G1  =  1 | OP_RMW | OP_GROUP | OP_I1W,
-	OP_G2  =  2 | OP_RMB | OP_GROUP | OP_I1B,
-	OP_G3  =  3 | OP_RMW | OP_GROUP | OP_I1B,
-	OP_G4  =  4 | OP_RMB | OP_GROUP,
-	OP_G5  =  5 | OP_RMW | OP_GROUP,
-	OP_G6  =  6 | OP_RMB | OP_GROUP,
-	OP_G7  =  7 | OP_RMW | OP_GROUP,
-	OP_G8  =  8 | OP_RMB | OP_GROUP,
-	OP_G9  =  9 | OP_RMW | OP_GROUP,
-	OP_G10 = 10 | OP_RMB | OP_GROUP,
-	OP_G11 = 11 | OP_RMW | OP_GROUP
-
-};
-
-
-static const opcode opcodes[352] = {
+static const i8086_opcode opcodes[352] = {
 
 // Main opcodes
 // 0x00
-	&op_addrmbr,  &op_addrmwr,  &op_addrmbf,  &op_addrmwf,  &op_addaib,  &op_addaiw,  &op_pushes,  &op_popes,
-	&op_iorrmbr,  &op_iorrmwr,  &op_iorrmbf,  &op_iorrmwf,  &op_ioraib,  &op_ioraiw,  &op_pushcs,  &op_popcs,
-	&op_adcrmbr,  &op_adcrmwr,  &op_adcrmbf,  &op_adcrmwf,  &op_adcaib,  &op_adcaiw,  &op_pushss,  &op_popss,
-	&op_sbbrmbr,  &op_sbbrmwr,  &op_sbbrmbf,  &op_sbbrmwf,  &op_sbbaib,  &op_sbbaiw,  &op_pushds,  &op_popds,
+	&op_addrmbr,  &op_addrmwr,  &op_addrmbf,  &op_addrmwf,  &op_addaib,   &op_addaiw,  &op_pushes,   &op_popes,
+	&op_iorrmbr,  &op_iorrmwr,  &op_iorrmbf,  &op_iorrmwf,  &op_ioraib,   &op_ioraiw,  &op_pushcs,   &op_popcs,
+	&op_adcrmbr,  &op_adcrmwr,  &op_adcrmbf,  &op_adcrmwf,  &op_adcaib,   &op_adcaiw,  &op_pushss,   &op_popss,
+	&op_sbbrmbr,  &op_sbbrmwr,  &op_sbbrmbf,  &op_sbbrmwf,  &op_sbbaib,   &op_sbbaiw,  &op_pushds,   &op_popds,
 // 0x20
-	&op_andrmbr,  &op_andrmwr,  &op_andrmbf,  &op_andrmwf,  &op_andaib,  &op_andaiw,  &op_seges,   &op_daa,
-	&op_subrmbr,  &op_subrmwr,  &op_subrmbf,  &op_subrmwf,  &op_subaib,  &op_subaiw,  &op_segcs,   &op_das,
-	&op_xorrmbr,  &op_xorrmwr,  &op_xorrmbf,  &op_xorrmwf,  &op_xoraib,  &op_xoraiw,  &op_segss,   &op_aaa,
-	&op_cmprmbr,  &op_cmprmwr,  &op_cmprmbf,  &op_cmprmwf,  &op_cmpaib,  &op_cmpaiw,  &op_segds,   &op_aas,
+	&op_andrmbr,  &op_andrmwr,  &op_andrmbf,  &op_andrmwf,  &op_andaib,   &op_andaiw,  &op_seges,    &op_daa,
+	&op_subrmbr,  &op_subrmwr,  &op_subrmbf,  &op_subrmwf,  &op_subaib,   &op_subaiw,  &op_segcs,    &op_das,
+	&op_xorrmbr,  &op_xorrmwr,  &op_xorrmbf,  &op_xorrmwf,  &op_xoraib,   &op_xoraiw,  &op_segss,    &op_aaa,
+	&op_cmprmbr,  &op_cmprmwr,  &op_cmprmbf,  &op_cmprmwf,  &op_cmpaib,   &op_cmpaiw,  &op_segds,    &op_aas,
 // 0x40
-	&op_incrw,   &op_incrw,   &op_incrw,   &op_incrw,   &op_incrw,   &op_incrw,   &op_incrw,   &op_incrw,
-	&op_decrw,   &op_decrw,   &op_decrw,   &op_decrw,   &op_decrw,   &op_decrw,   &op_decrw,   &op_decrw,
-	&op_pushrw,  &op_pushrw,  &op_pushrw,  &op_pushrw,  &op_pushsp,  &op_pushrw,  &op_pushrw,  &op_pushrw,
-	&op_poprw,   &op_poprw,   &op_poprw,   &op_poprw,   &op_poprw,   &op_poprw,   &op_poprw,   &op_poprw,
+	&op_incrw,    &op_incrw,    &op_incrw,    &op_incrw,    &op_incrw,    &op_incrw,   &op_incrw,    &op_incrw,
+	&op_decrw,    &op_decrw,    &op_decrw,    &op_decrw,    &op_decrw,    &op_decrw,   &op_decrw,    &op_decrw,
+	&op_pushrw,   &op_pushrw,   &op_pushrw,   &op_pushrw,   &op_pushsp,   &op_pushrw,  &op_pushrw,   &op_pushrw,
+	&op_poprw,    &op_poprw,    &op_poprw,    &op_poprw,    &op_poprw,    &op_poprw,   &op_poprw,    &op_poprw,
 // 0x60
-	&op_jco,     &op_jcno,    &op_jcc,     &op_jcnc,    &op_jcz,     &op_jcnz,    &op_jcbe,    &op_jcnbe,
-	&op_jcs,     &op_jcns,    &op_jcp,     &op_jcnp,    &op_jcl,     &op_jcnl,    &op_jcle,    &op_jcnle,
-	&op_jco,     &op_jcno,    &op_jcc,     &op_jcnc,    &op_jcz,     &op_jcnz,    &op_jcbe,    &op_jcnbe,
-	&op_jcs,     &op_jcns,    &op_jcp,     &op_jcnp,    &op_jcl,     &op_jcnl,    &op_jcle,    &op_jcnle,
+	&op_jco,      &op_jcno,     &op_jcc,      &op_jcnc,     &op_jcz,      &op_jcnz,    &op_jcbe,     &op_jcnbe,
+	&op_jcs,      &op_jcns,     &op_jcp,      &op_jcnp,     &op_jcl,      &op_jcnl,    &op_jcle,     &op_jcnle,
+	&op_jco,      &op_jcno,     &op_jcc,      &op_jcnc,     &op_jcz,      &op_jcnz,    &op_jcbe,     &op_jcnbe,
+	&op_jcs,      &op_jcns,     &op_jcp,      &op_jcnp,     &op_jcl,      &op_jcnl,    &op_jcle,     &op_jcnle,
 // 0x80
-	&op_group,    &op_group,    &op_group,    &op_group,    &op_tstrmb,  &op_tstrmw, &op_xchrmb,  &op_xchrmw,
-	&op_movrrmbr, &op_movrrmwr, &op_movrrmbf, &op_movrrmwf, &op_movrrmwr, &op_lear,   &op_movrrmwf, &op_poprmw,
-	&op_xcharw,   &op_xcharw,   &op_xcharw,   &op_xcharw,   &op_xcharw,  &op_xcharw, &op_xcharw,  &op_xcharw,
-	&op_cbw,      &op_cwd,      &op_callf,    &op_wait,     &op_pushfw,   &op_popfw,   &op_sahf,    &op_lahf,
+	&op_nop,      &op_nop,      &op_nop,      &op_nop,      &op_tstrmb,   &op_tstrmw,  &op_xchrmb,   &op_xchrmw,
+	&op_movrrmbr, &op_movrrmwr, &op_movrrmbf, &op_movrrmwf, &op_movsrmwr, &op_lear,    &op_movsrmwf, &op_poprmw,
+	&op_xcharw,   &op_xcharw,   &op_xcharw,   &op_xcharw,   &op_xcharw,   &op_xcharw,  &op_xcharw,   &op_xcharw,
+	&op_cbw,      &op_cwd,      &op_callf,    &op_wait,     &op_pushfw,   &op_popfw,   &op_sahf,     &op_lahf,
 // 0xa0
-	&op_movambf, &op_movamwf, &op_movambr, &op_movamwr, &op_movsb,   &op_movsw,   &op_cmpsb,   &op_cmpsw,
-	&op_tstaib,  &op_tstaiw,  &op_stosb,   &op_stosw,   &op_lodsb,   &op_lodsw,   &op_scasb,   &op_scasw,
-	&op_movrib,  &op_movrib,  &op_movrib,  &op_movrib,  &op_movrib,  &op_movrib,  &op_movrib,  &op_movrib,
-	&op_movriw,  &op_movriw,  &op_movriw,  &op_movriw,  &op_movriw,  &op_movriw,  &op_movriw,  &op_movriw,
+	&op_movambf,  &op_movamwf,  &op_movambr,  &op_movamwr,  &op_movsb,    &op_movsw,   &op_cmpsb,    &op_cmpsw,
+	&op_tstaib,   &op_tstaiw,   &op_stosb,    &op_stosw,    &op_lodsb,    &op_lodsw,   &op_scasb,    &op_scasw,
+	&op_movrib,   &op_movrib,   &op_movrib,   &op_movrib,   &op_movrib,   &op_movrib,  &op_movrib,   &op_movrib,
+	&op_movriw,   &op_movriw,   &op_movriw,   &op_movriw,   &op_movriw,   &op_movriw,  &op_movriw,   &op_movriw,
 // 0xc0
-	&op_retn,    &op_retn,    &op_retn,    &op_retn,    &op_lesr,    &op_ldsr,    &op_movrmib, &op_movrmiw,
-	&op_retf,    &op_retf,    &op_retf,    &op_retf,    &op_int3,    &op_intib,   &op_into,    &op_iret,
-	&op_group,   &op_group,   &op_group,   &op_group,   &op_aam,     &op_aad,     &op_undef,   &op_xlatab,
-	&op_nop,     &op_nop,     &op_nop,     &op_nop,     &op_nop,     &op_nop,     &op_nop,     &op_nop,
+	&op_undef,    &op_undef,    &op_retnw,    &op_retn0,    &op_lesr,     &op_ldsr,    &op_movrmib,  &op_movrmiw,
+	&op_undef,    &op_undef,    &op_retfw,    &op_retf0,    &op_int3,     &op_intib,   &op_into,     &op_iret,
+	&op_nop,      &op_nop,      &op_nop,      &op_nop,      &op_aam,      &op_aad,     &op_undef,    &op_xlatab,
+	&op_nop,      &op_nop,      &op_nop,      &op_nop,      &op_nop,      &op_nop,     &op_nop,      &op_nop,
 // 0xe0
-	&op_loopnzr, &op_loopzr,  &op_loopr,   &op_jcxzr,   &op_inib,    &op_iniw,    &op_outib,   &op_outiw,
-	&op_calln,   &op_jmpn,    &op_jmpf,    &op_jmpn,    &op_inrb,    &op_inrw,    &op_outrb,   &op_outrw,
-	&op_lock,    &op_undef,   &op_repne,   &op_repeq,    &op_nop,     &op_cmc,     &op_group,   &op_group,
-	&op_clc,     &op_stc,     &op_cli,     &op_sti,     &op_cld,     &op_std,     &op_group,   &op_group,
+	&op_loopnzr,  &op_loopzr,   &op_loopr,    &op_jcxzr,    &op_inib,     &op_iniw,    &op_outib,    &op_outiw,
+	&op_calln,    &op_jmpnw,    &op_jmpf,     &op_jmpnb,    &op_inrb,     &op_inrw,    &op_outrb,    &op_outrw,
+	&op_lock,     &op_undef,    &op_repne,    &op_repeq,    &op_nop,      &op_cmc,     &op_nop,      &op_nop,
+	&op_clc,      &op_stc,      &op_cli,      &op_sti,      &op_cld,      &op_std,     &op_nop,      &op_nop,
 
 // Group opcodes
 // 0x100
-	&op_addrmib, &op_iorrmib, &op_adcrmib, &op_sbbrmib, &op_andrmib, &op_subrmib, &op_xorrmib, &op_cmprmib,  // 0:  0x80
-	&op_addrmiw, &op_iorrmiw, &op_adcrmiw, &op_sbbrmiw, &op_andrmiw, &op_subrmiw, &op_xorrmiw, &op_cmprmiw,  // 1:  0x81
-	&op_addrmib, &op_iorrmib, &op_adcrmib, &op_sbbrmib, &op_andrmib, &op_subrmib, &op_xorrmib, &op_cmprmib,  // 2:  0x82
-	&op_addrmiw, &op_iorrmiw, &op_adcrmiw, &op_sbbrmiw, &op_andrmiw, &op_subrmiw, &op_xorrmiw, &op_cmprmiw,  // 3:  0x83
+	&op_addrmbib, &op_iorrmbib, &op_adcrmbib, &op_sbbrmbib, &op_andrmbib, &op_subrmbib, &op_xorrmbib, &op_cmprmbib,  // 0:  0x80
+	&op_addrmwiw, &op_iorrmwiw, &op_adcrmwiw, &op_sbbrmwiw, &op_andrmwiw, &op_subrmwiw, &op_xorrmwiw, &op_cmprmwiw,  // 1:  0x81
+	&op_addrmbib, &op_iorrmbib, &op_adcrmbib, &op_sbbrmbib, &op_andrmbib, &op_subrmbib, &op_xorrmbib, &op_cmprmbib,  // 2:  0x82
+	&op_addrmwib, &op_iorrmwib, &op_adcrmwib, &op_sbbrmwib, &op_andrmwib, &op_subrmwib, &op_xorrmwib, &op_cmprmwib,  // 3:  0x83
 // 0x120
 	&op_rolb1,   &op_rorb1,   &op_rclb1,   &op_rcrb1,   &op_shlb1,   &op_shrb1,   &op_salb1,   &op_sarb1,    // 4:  0xd0
 	&op_rolw1,   &op_rorw1,   &op_rclw1,   &op_rcrw1,   &op_shlw1,   &op_shrw1,   &op_salw1,   &op_sarw1,    // 5:  0xd1
@@ -1266,43 +922,43 @@ static const uint opflags[352] = {
 
 // Main opcodes
 // 0x00
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, 0,        0,
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, 0,        0,
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, 0,        0,
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, 0,        0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   0,        0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   0,        0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   0,        0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   0,        0,
 // 0x20
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, OP_OVRD,  0,
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, OP_OVRD,  0,
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, OP_OVRD,  0,
-	OP_RMB,  OP_RMW,  OP_RMB,  OP_RMW,  OP_RIBB, OP_RIWW, OP_OVRD,  0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   OP_OVRD,  0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   OP_OVRD,  0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   OP_OVRD,  0,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_W8,    OP_W16,   OP_OVRD,  0,
 // 0x40
 	OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,
 	OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,
 	OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,
 	OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,
 // 0x60
-	OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,
-	OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,
-	OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,
-	OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,
+	0,        0,        0,        0,        0,        0,        0,        0,
+	0,        0,        0,        0,        0,        0,        0,        0,
+	0,        0,        0,        0,        0,        0,        0,        0,
+	0,        0,        0,        0,        0,        0,        0,        0,
 // 0x80
-	OP_G0,    OP_G1,    OP_G2,    OP_G3,    OP_RMB,   OP_RMW,  OP_RMB,  OP_RMW,
-	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_SMB,   OP_RMW | OP_NEASEG,  OP_SMB,  OP_RMW,
+	OP_G0,    OP_G1,    OP_G2,    OP_G3,    OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,
+	OP_RMB,   OP_RMW,   OP_RMB,   OP_RMW,   OP_SEGW,  OP_RMW,   OP_SEGW,  OP_RMW,
 	OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,
-	0,        0,        OP_ADRF,  0,        0,        0,        0,        0,
+	0,        0,        0,        0,        0,        0,        0,        0,
 // 0xa0
-	OP_RANB, OP_RANW,   OP_RANB,  OP_RANW,  OP_W8,    OP_W16,   OP_W8,    OP_W16,
-	OP_RIBB, OP_RIWW,   OP_W8,    OP_W16,   OP_W8,    OP_W16,   0,        0,
-	OP_R2IB,  OP_R2IB,  OP_R2IB,  OP_R2IB,  OP_R2IB,  OP_R2IB,  OP_R2IB,  OP_R2IB,
-	OP_R2IW,  OP_R2IW,  OP_R2IW,  OP_R2IW,  OP_R2IW,  OP_R2IW,  OP_R2IW,  OP_R2IW,
+	OP_W8,    OP_W16,   OP_W8,    OP_W16,   OP_W8,    OP_W16,   OP_W8,    OP_W16,
+	OP_W8,    OP_W16,   OP_W8,    OP_W16,   OP_W8,    OP_W16,   0,        0,
+	OP_R02B,  OP_R02B,  OP_R02B,  OP_R02B,  OP_R02B,  OP_R02B,  OP_R02B,  OP_R02B,
+	OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,  OP_R02W,
 // 0xc0
-	OP_I0W,   0,        OP_I0W,   0,        OP_RMW,   OP_RMW,   OP_RMIB,  OP_RMIW,
-	OP_I0W,   0,        OP_I0W,   0,        0,        OP_I0B,   0,        0,
-	OP_G4,    OP_G5,    OP_G6,    OP_G7,    OP_RIBB,  OP_RIBB, 0,        0,
+	0,        0,        0,        0,        OP_RMW,   OP_RMW,   OP_RMB,   OP_RMW,
+	0,        0,        0,        0,        0,        0,        0,        0,
+	OP_G4,    OP_G5,    OP_G6,    OP_G7,    OP_W8,    OP_W8,    0,        0,
 	OP_MODRM, OP_MODRM, OP_MODRM, OP_MODRM, OP_MODRM, OP_MODRM, OP_MODRM, OP_MODRM,
 // 0xe0
-	OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_ADRR,  OP_RIBB, OP_RIBW, OP_RIBB, OP_RIBW,
-	OP_ADRN,  OP_ADRN,  OP_ADRF,  OP_ADRR,  OP_W8,    OP_W16,   OP_W8,    OP_W16,
+	0,        0,        0,        0,        OP_W8,    OP_W16,   OP_W8,    OP_W16,
+	0,        0,        0,        0,        OP_W8,    OP_W16,   OP_W8,    OP_W16,
 	OP_OVRD,  0,        OP_OVRD,  OP_OVRD,  0,        0,        OP_G8,    OP_G9,
 	0,        0,        0,        0,        0,        0,        OP_G10,   OP_G11,
 
@@ -1326,52 +982,133 @@ static const uint opflags[352] = {
 };
 
 
-static inline aluu memrdb(CPU, uint seg, u16 ofs) {
-	return bus_read8(&cpu->mem, *get_rs(cpu, seg) * 16 + ofs);
-}
+static const uint demodrm[32] = {
 
-static inline aluu memrdw(CPU, uint seg, u16 ofs) {
-	return bus_read16(&cpu->mem, *get_rs(cpu, seg) * 16 + ofs);
-}
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX | OP_MODRM_EA_R1_SI,  // 00: [BX + SI]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX | OP_MODRM_EA_R1_DI,  // 01: [BX + DI]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP | OP_MODRM_EA_R1_SI,  // 02: [BP + SI]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP | OP_MODRM_EA_R1_DI,  // 03: [BP + DI]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_SI,                      // 04: [SI]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_DI,                      // 05: [DI]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_DISP16,                     // 06: [DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX,                      // 07: [BX]
 
-static inline void memwrb(CPU, uint seg, u16 ofs, aluu v) {
-	bus_write8(&cpu->mem, *get_rs(cpu, seg) * 16 + ofs, v);
-}
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX | OP_MODRM_EA_R1_SI | OP_MODRM_EA_DISP8,   // 40: [BX + SI + DISP8]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX | OP_MODRM_EA_R1_DI | OP_MODRM_EA_DISP8,   // 41: [BX + DI + DISP8]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP | OP_MODRM_EA_R1_SI | OP_MODRM_EA_DISP8,   // 42: [BP + SI + DISP8]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP | OP_MODRM_EA_R1_DI | OP_MODRM_EA_DISP8,   // 43: [BP + DI + DISP8]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_SI                     | OP_MODRM_EA_DISP8,   // 44: [SI + DISP8]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_DI                     | OP_MODRM_EA_DISP8,   // 45: [DI + DISP8]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP                     | OP_MODRM_EA_DISP8,   // 46: [BP + DISP8]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX                     | OP_MODRM_EA_DISP8,   // 47: [BX + DISP8]
 
-static inline void memwrw(CPU, uint seg, u16 ofs, aluu v) {
-	bus_write16(&cpu->mem, *get_rs(cpu, seg) * 16 + ofs, v);
-}
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX | OP_MODRM_EA_R1_SI | OP_MODRM_EA_DISP16,  // 80: [BX + SI + DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX | OP_MODRM_EA_R1_DI | OP_MODRM_EA_DISP16,  // 81: [BX + DI + DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP | OP_MODRM_EA_R1_SI | OP_MODRM_EA_DISP16,  // 82: [BP + SI + DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP | OP_MODRM_EA_R1_DI | OP_MODRM_EA_DISP16,  // 83: [BP + DI + DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_SI                     | OP_MODRM_EA_DISP16,  // 84: [SI + DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_DI                     | OP_MODRM_EA_DISP16,  // 85: [DI + DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_SS | OP_MODRM_EA_R0_BP                     | OP_MODRM_EA_DISP16,  // 86: [BP + DISP16]
+	OP_MODRM_MEMORY | OP_MODRM_SEG_DS | OP_MODRM_EA_R0_BX                     | OP_MODRM_EA_DISP16,  // 87: [BX + DISP16]
 
+	OP_MODRM_REGISTER | OP_MODRM_REG_AX_AL | OP_MODRM_REG_ES,  // C0: AX AL ES
+	OP_MODRM_REGISTER | OP_MODRM_REG_CX_CL | OP_MODRM_REG_CS,  // C1: CX CL CS
+	OP_MODRM_REGISTER | OP_MODRM_REG_DX_DL | OP_MODRM_REG_SS,  // C2: DX DL SS
+	OP_MODRM_REGISTER | OP_MODRM_REG_BX_BL | OP_MODRM_REG_DS,  // C3: BX BL DS
+	OP_MODRM_REGISTER | OP_MODRM_REG_SP_AH | OP_MODRM_REG_ES,  // C4: SP AH ES
+	OP_MODRM_REGISTER | OP_MODRM_REG_BP_CH | OP_MODRM_REG_CS,  // C5: BP CH CS
+	OP_MODRM_REGISTER | OP_MODRM_REG_SI_DH | OP_MODRM_REG_SS,  // C6: SI DH SS
+	OP_MODRM_REGISTER | OP_MODRM_REG_DI_BH | OP_MODRM_REG_DS   // C7: DI BH DS
 
-
+};
 
 
 
 void i8086_init(CPU)
 {
 
-	bus_init(&cpu->io);
-	bus_init(&cpu->mem);
+	cpu->regs.zero = 0;
 
-	cpu->regs.ds = 0x0000;
-	cpu->regs.es = 0x0000;
-	cpu->regs.ss = 0x0000;
-
-	cpu->regs.bp.w = 0x0000;
-	cpu->regs.sp.w = 0x0000;
-	cpu->regs.si.w = 0x0000;
-	cpu->regs.di.w = 0x0000;
-
-	cpu->regs.ax.w = 0x0000;
-	cpu->regs.bx.w = 0x0000;
-	cpu->regs.cx.w = 0x0000;
-	cpu->regs.dx.w = 0x0000;
-
-	cpu->flags.w = 0x0002;
+	cpu->regs.ax.w = 0;
+	cpu->regs.bx.w = 0;
+	cpu->regs.cx.w = 0;
+	cpu->regs.dx.w = 0;
+	cpu->regs.si.w = 0;
+	cpu->regs.di.w = 0;
+	cpu->regs.bp.w = 0;
+	cpu->regs.sp.w = 0;
 
 	cpu->interrupt.irq     = 0;
 	cpu->interrupt.irq_act = false;
 	cpu->interrupt.nmi_act = false;
+	cpu->interrupt.delay   = false;
+
+	cpu->undef = &op_nop;
+
+	memory_init(&cpu->memory.mem);
+
+	io_init(&cpu->iob);
+	io_init(&cpu->iow);
+
+
+	// Calculate MOD/RM decoding table
+	for (int n=0; n < 32; n++) {
+
+		const uint flags = demodrm[n];
+		auto       dmdrm = &cpu->microcode.demodrm[n];
+
+		dmdrm->memory = (flags & OP_MODRM_MEMORY) != 0;
+
+		dmdrm->ea_seg    = (flags & OP_MODRM_SEG_SS)? REG_SS: REG_DS;
+		dmdrm->ea_disp8  = (flags & OP_MODRM_EA_DISP8)  != 0;
+		dmdrm->ea_disp16 = (flags & OP_MODRM_EA_DISP16) != 0;
+
+		dmdrm->ea_reg0 =
+			((flags & OP_MODRM_EA_R0) == OP_MODRM_EA_R0_BX)? &cpu->regs.bx.w:
+			((flags & OP_MODRM_EA_R0) == OP_MODRM_EA_R0_BP)? &cpu->regs.bp.w:
+			((flags & OP_MODRM_EA_R0) == OP_MODRM_EA_R0_SI)? &cpu->regs.si.w:
+			((flags & OP_MODRM_EA_R0) == OP_MODRM_EA_R0_DI)? &cpu->regs.di.w: &cpu->regs.zero;
+
+		dmdrm->ea_reg1 =
+			((flags & OP_MODRM_EA_R1) == OP_MODRM_EA_R1_BX)? &cpu->regs.bx.w:
+			((flags & OP_MODRM_EA_R1) == OP_MODRM_EA_R1_BP)? &cpu->regs.bp.w:
+			((flags & OP_MODRM_EA_R1) == OP_MODRM_EA_R1_SI)? &cpu->regs.si.w:
+			((flags & OP_MODRM_EA_R1) == OP_MODRM_EA_R1_DI)? &cpu->regs.di.w: &cpu->regs.zero;
+
+
+		switch (flags & OP_MODRM_REG_GENERIC) {
+
+			case OP_MODRM_REG_AX_AL: dmdrm->regw = &cpu->regs.ax.w; dmdrm->regb = &cpu->regs.ax.l; break;
+			case OP_MODRM_REG_BX_BL: dmdrm->regw = &cpu->regs.bx.w; dmdrm->regb = &cpu->regs.bx.l; break;
+			case OP_MODRM_REG_CX_CL: dmdrm->regw = &cpu->regs.cx.w; dmdrm->regb = &cpu->regs.cx.l; break;
+			case OP_MODRM_REG_DX_DL: dmdrm->regw = &cpu->regs.dx.w; dmdrm->regb = &cpu->regs.dx.l; break;
+			case OP_MODRM_REG_SI_DH: dmdrm->regw = &cpu->regs.si.w; dmdrm->regb = &cpu->regs.dx.h; break;
+			case OP_MODRM_REG_DI_BH: dmdrm->regw = &cpu->regs.di.w; dmdrm->regb = &cpu->regs.bx.h; break;
+			case OP_MODRM_REG_SP_AH: dmdrm->regw = &cpu->regs.sp.w; dmdrm->regb = &cpu->regs.ax.h; break;
+			case OP_MODRM_REG_BP_CH: dmdrm->regw = &cpu->regs.bp.w; dmdrm->regb = &cpu->regs.cx.h; break;
+
+			default:
+				dmdrm->regw = NULL;
+				dmdrm->regb = NULL;
+				break;
+
+		}
+
+
+		switch (flags & OP_MODRM_REG_SEGMENT) {
+
+			case OP_MODRM_REG_CS: dmdrm->regs = (void*)REG_CS; break;
+			case OP_MODRM_REG_DS: dmdrm->regs = (void*)REG_DS; break;
+			case OP_MODRM_REG_ES: dmdrm->regs = (void*)REG_ES; break;
+			case OP_MODRM_REG_SS: dmdrm->regs = (void*)REG_SS; break;
+
+			default:
+				dmdrm->regs = NULL;
+				break;
+
+		}
+
+	}
 
 	i8086_reset(cpu);
 
@@ -1382,27 +1119,32 @@ void i8086_init(CPU)
 void i8086_reset(CPU)
 {
 
-	cpu->regs.cs = 0xffff;
+	for (int seg=0; seg < 5; seg++)
+		memselect(cpu, seg, 0);
+
+	memselect(cpu, REG_CS, 0xffff);
 	cpu->regs.ip = 0x0000;
 
-	cpu->regs.scs = cpu->regs.cs;
-	cpu->regs.sip = cpu->regs.ip;
+	cpu->flags.c = false;
+	cpu->flags.p = false;
+	cpu->flags.a = false;
+	cpu->flags.z = false;
+	cpu->flags.s = false;
+	cpu->flags.v = false;
+	cpu->flags.d = false;
+	cpu->flags.t = false;
+	cpu->flags.i = false;
 
-	cpu->insn.fetch_opcode   = true;
-	cpu->insn.fetch_modrm    = false;
-	cpu->insn.fetch_simm8a   = false;
-	cpu->insn.fetch_uimm16a  = false;
-	cpu->insn.fetch_simm8b   = false;
-	cpu->insn.fetch_uimm16b  = false;
-	cpu->insn.compute_eaimm0 = false;
-	cpu->insn.compute_easeg  = false;
-	cpu->insn.repeat_eq      = false;
-	cpu->insn.repeat_ne      = false;
-	cpu->insn.complete       = false;
+	cpu->insn.fetch     = true;
+	cpu->insn.repeat_eq = false;
+	cpu->insn.repeat_ne = false;
 
 	cpu->insn.opcode  = 0;
 	cpu->insn.modrm   = 0;
-	cpu->insn.segment = 255;
+	cpu->insn.segment = REG_ZERO;
+
+	cpu->regs.scs = SEGMENT(REG_CS);
+	cpu->regs.sip = cpu->regs.ip;
 
 }
 
@@ -1421,226 +1163,119 @@ int i8086_intrq(CPU, uint nmi, uint irq)
 
 
 
-void i8086_interrupt(CPU, uint irq)
-{
-
-	ADVSP(-6);
-	STSPW(4, cpu->flags.w);
-	STSPW(2, cpu->regs.cs);
-	STSPW(0, cpu->regs.ip);
-
-	cpu->flags.i = false;
-	cpu->flags.t = false;
-
-	cpu->regs.ip = bus_read16(&cpu->mem, 4 * (u8)irq + 0);
-	cpu->regs.cs = bus_read16(&cpu->mem, 4 * (u8)irq + 2);
-
-}
-
-
-
 void i8086_tick(CPU)
 {
 
-	if (cpu->interrupt.nmi_act) {
+	if (!cpu->interrupt.delay) {
 
-		i8086_interrupt(cpu, I8086_VECTOR_NMI);
+		if (cpu->interrupt.nmi_act) {
 
-		cpu->interrupt.nmi_act = false;
-		cpu->insn.fetch_opcode = true;
+			interrupt(cpu, I8086_VECTOR_NMI, cpu->regs.scs, cpu->regs.sip);
 
-	} else if (cpu->interrupt.irq_act) {
+			cpu->interrupt.nmi_act = false;
+			cpu->insn.fetch        = true;
 
-		cpu->regs.cs = cpu->regs.scs;
-		cpu->regs.ip = cpu->regs.sip;
+		} else if (cpu->flags.i && cpu->interrupt.irq_act) {
 
-		i8086_interrupt(cpu, cpu->interrupt.irq);
+			interrupt(cpu, cpu->interrupt.irq, cpu->regs.scs, cpu->regs.sip);
 
-		cpu->interrupt.irq_act = false;
-		cpu->insn.fetch_opcode = true;
+			cpu->interrupt.irq_act = false;
+			cpu->insn.fetch        = true;
 
-	} else if (cpu->flags.t && cpu->insn.fetch_opcode)
-		i8086_interrupt(cpu, I8086_VECTOR_SSTEP);
+		} else if (cpu->flags.t)
+			interrupt(cpu, I8086_VECTOR_SSTEP, cpu->regs.scs, cpu->regs.sip);
+
+	} else
+		cpu->interrupt.delay = false;
 
 
-	if (cpu->insn.fetch_opcode) { // Fetch and decode opcode
+	if (cpu->insn.fetch) { // Fetch and decode opcode
 
-		const uint op  = bus_read8(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip++);
+		const uint op  = LDIPUB();
 		const uint opf = opflags[op];
 
-		cpu->insn.opcode         = op;
-		cpu->insn.modrm          = 0;
-		cpu->insn.fetch_opcode   = false;
-		cpu->insn.fetch_modrm    = opf & OP_MODRM;
-		cpu->insn.fetch_simm8a   = opf & OP_I0B;
-		cpu->insn.fetch_uimm16a  = opf & OP_I0W;
-		cpu->insn.fetch_simm8b   = opf & OP_I1B;
-		cpu->insn.fetch_uimm16b  = opf & OP_I1W;
-		cpu->insn.compute_eaimm0 = opf & OP_EAIMM0;
-		cpu->insn.compute_easeg  = opf & OP_EASEG;
-		cpu->insn.compute_neaseg = opf & OP_NEASEG;
-		cpu->insn.complete       = true;
+		cpu->insn.opcode = op;
+		cpu->insn.modrm  = 0;
+		cpu->insn.addr   = 0;
 
-		cpu->insn.addr = 0;
-		cpu->insn.imm0 = 0;
-		cpu->insn.imm1 = 0;
-
-		cpu->insn.op_wide     = opf & OP_W16;
-		cpu->insn.op_rseg     = opf & OP_RSEG;
-		cpu->insn.op_group    = opf & OP_GROUP;
 		cpu->insn.op_override = opf & OP_OVRD;
 		cpu->insn.op_memory   = false;
+		cpu->insn.op_segment  = opf & OP_RSEG;
 
 		cpu->insn.reg0b = NULL;
 		cpu->insn.reg0w = NULL;
 		cpu->insn.reg1b = NULL;
 		cpu->insn.reg1w = NULL;
 
-		if (opf & OP_R02)
-			if (cpu->insn.op_wide) cpu->insn.reg0w = get_r16(cpu, op & 0x07);
-			else                   cpu->insn.reg0b = get_r8( cpu, op & 0x07);
+		if (opf & OP_R02) {
 
-		if (opf & OP_GROUP)
-			cpu->insn.opcode = 256 + (opf & 0xff) * 8;
+			const auto reg0 = &cpu->microcode.demodrm[(op & 0x07) + 24];
 
-	}
+			cpu->insn.reg0w = reg0->regw;
+			cpu->insn.reg0b = reg0->regb;
+
+		}
 
 
-	if (cpu->insn.fetch_modrm) { // Fetch and decode MODRM
+		if (opf & OP_MODRM) { // Fetch and decode MODRM
 
-		cpu->insn.modrm       = bus_read8(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip++);
-		cpu->insn.fetch_modrm = false;
+			cpu->insn.modrm = LDIPUB();
 
-		const uint mod = cpu->insn.modrm & 0xc0;
-		const uint reg = cpu->insn.modrm & 0x38;
-		const uint rm  = cpu->insn.modrm & 0x07;
+			const uint mod = (cpu->insn.modrm >> 6) & 3;
+			const uint reg = (cpu->insn.modrm >> 3) & 7;
+			const uint rm  = (cpu->insn.modrm >> 0) & 7;
 
-		bool addr_ss = false;
+			const auto demodrm = &cpu->microcode.demodrm[mod * 8 + rm];
 
-		if      (cpu->insn.op_group) cpu->insn.opcode += reg >> 3;
-		else if (cpu->insn.op_rseg)  cpu->insn.reg0w = get_rs( cpu, reg >> 3);
-		else if (cpu->insn.op_wide)  cpu->insn.reg0w = get_r16(cpu, reg >> 3);
-		else                         cpu->insn.reg0b = get_r8( cpu, reg >> 3);
+			if (opf & OP_GROUP)
+				cpu->insn.opcode = 256 + (opf & 0xff) * 8 + reg;
 
-		if (mod != 0xc0) { // Memory mode
+			else {
 
-			cpu->insn.fetch_simm8a  = (mod == 0x40);
-			cpu->insn.fetch_uimm16a = (mod == 0x80) || (mod == 0x00 && rm == 0x06);
+				const auto reg0 = &cpu->microcode.demodrm[reg + 24];
 
-			if (rm & 0x04) {
-
-				cpu->insn.addr =
-					(rm == 0x04)? cpu->regs.si.w:
-					(rm == 0x05)? cpu->regs.di.w:
-					(rm == 0x06)?
-						((mod != 0x00)? cpu->regs.bp.w: 0):
-						cpu->regs.bx.w;
-
-				addr_ss = (mod != 0x00) && (rm == 0x06);
-
-			} else {
-
-				cpu->insn.addr  = (rm & 0x01)? cpu->regs.di.w: cpu->regs.si.w;
-				cpu->insn.addr += (rm & 0x02)? cpu->regs.bp.w: cpu->regs.bx.w;
-
-				addr_ss = (rm & 0x02) != 0;
+				cpu->insn.reg0w = cpu->insn.op_segment? reg0->regs: reg0->regw;
+				cpu->insn.reg0b = reg0->regb;
 
 			}
 
-			if (cpu->insn.segment == 255)
-				cpu->insn.segment = addr_ss? 2: 3;
 
-			cpu->insn.compute_eaimm0 = cpu->insn.fetch_simm8a | cpu->insn.fetch_uimm16a;
-			cpu->insn.compute_easeg  = true;
-			cpu->insn.op_memory      = true;
+			if (demodrm->memory) {
 
-		} else { // Register mode
+				cpu->insn.addr = *demodrm->ea_reg0 + *demodrm->ea_reg1;
 
-			if (cpu->insn.op_wide) cpu->insn.reg1w = get_r16(cpu, rm);
-			else                   cpu->insn.reg1b = get_r8( cpu, rm);
+				if      (demodrm->ea_disp8)  cpu->insn.addr += LDIPSB();
+				else if (demodrm->ea_disp16) cpu->insn.addr += LDIPUW();
+
+				if (cpu->insn.segment == REG_ZERO)
+					cpu->insn.segment = demodrm->ea_seg;
+
+				cpu->insn.op_memory = true;
+
+			} else {
+
+				cpu->insn.reg1b = demodrm->regb;
+				cpu->insn.reg1w = demodrm->regw;
+
+			}
 
 		}
 
-	}
-
-
-	if (cpu->insn.fetch_simm8a) { // Read a sign-extended 8bit value as first immediate operand
-
-		cpu->insn.imm0         = (i8)bus_read8(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip);
-		cpu->insn.fetch_simm8a = false;
-
-		cpu->regs.ip++;
-
-	}
-
-
-	if (cpu->insn.fetch_uimm16a) { // Read a 16bit value as first immediate operand
-
-		cpu->insn.imm0          = bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip);
-		cpu->insn.fetch_uimm16a = false;
-
-		cpu->regs.ip += 2;
-
-	}
-
-
-	if (cpu->insn.fetch_simm8b) { // Read a sign-extended 8bit value as second immediate operand
-
-		cpu->insn.imm1         = (i8)bus_read8(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip);
-		cpu->insn.fetch_simm8b = false;
-
-		cpu->regs.ip++;
-
-	}
-
-
-	if (cpu->insn.fetch_uimm16b) { // Read a 16bit value as second immediate operand
-
-		cpu->insn.imm1          = bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip);
-		cpu->insn.fetch_uimm16b = false;
-
-		cpu->regs.ip += 2;
-
-	}
-
-
-	if (cpu->insn.compute_eaimm0) {
-
-		cpu->insn.addr           += cpu->insn.imm0;
-		cpu->insn.compute_eaimm0  = false;
-
-	}
-
-
-	if (cpu->insn.compute_easeg) {
-
-		cpu->insn.addr &= 0xffffu;
-
-		if (!cpu->insn.compute_neaseg) {
-			if   (cpu->insn.segment >= 0) cpu->insn.addr += 16 * *get_rs(cpu, cpu->insn.segment);
-			else                          cpu->insn.addr += 16 * cpu->regs.ds;
-		}
-
-		cpu->insn.compute_easeg = false;
+		if (cpu->insn.segment == REG_ZERO)
+			cpu->insn.segment = REG_DS;
 
 	}
 
 	opcodes[cpu->insn.opcode](cpu);
 
-	if (cpu->insn.complete) {
+	if (cpu->insn.fetch && !cpu->insn.op_override) {
 
-		cpu->insn.fetch_opcode = true;
+		cpu->regs.scs = SEGMENT(REG_CS);
+		cpu->regs.sip = cpu->regs.ip;
 
-		if (!cpu->insn.op_override) {
-
-			cpu->regs.scs = cpu->regs.cs;
-			cpu->regs.sip = cpu->regs.ip;
-
-			cpu->insn.repeat_eq = false;
-			cpu->insn.repeat_ne = false;
-			cpu->insn.segment   = 255;
-
-		}
+		cpu->insn.repeat_eq = false;
+		cpu->insn.repeat_ne = false;
+		cpu->insn.segment   = REG_ZERO;
 
 	}
 
@@ -1648,19 +1283,110 @@ void i8086_tick(CPU)
 
 
 
-void op_divrmb(CPU)
+uint i8086_reg_get(i8086 *cpu, uint reg)
 {
 
-	const aluu tmp = LDEAR1MB();
+	switch (reg) {
+
+		case REG_CS: return SEGMENT(REG_CS);
+		case REG_DS: return SEGMENT(REG_DS);
+		case REG_ES: return SEGMENT(REG_ES);
+		case REG_SS: return SEGMENT(REG_SS);
+
+		case REG_IP: return cpu->regs.ip;
+
+		case REG_AX: return cpu->regs.ax.w;
+		case REG_BX: return cpu->regs.bx.w;
+		case REG_CX: return cpu->regs.cx.w;
+		case REG_DX: return cpu->regs.dx.w;
+
+		case REG_AL: return cpu->regs.ax.l;
+		case REG_BL: return cpu->regs.bx.l;
+		case REG_CL: return cpu->regs.cx.l;
+		case REG_DL: return cpu->regs.dx.l;
+
+		case REG_AH: return cpu->regs.ax.h;
+		case REG_BH: return cpu->regs.bx.h;
+		case REG_CH: return cpu->regs.cx.h;
+		case REG_DH: return cpu->regs.dx.h;
+
+		case REG_SI: return cpu->regs.si.w;
+		case REG_DI: return cpu->regs.di.w;
+		case REG_BP: return cpu->regs.bp.w;
+		case REG_SP: return cpu->regs.sp.w;
+
+		case REG_FLAGS: return getf_w(cpu);
+		case REG_ZERO:  return cpu->regs.zero;
+
+		case REG_SHADOW_CS: return cpu->regs.scs;
+		case REG_SHADOW_IP: return cpu->regs.sip;
+
+		default:
+			return 0;
+
+	}
+
+}
+
+
+
+void i8086_reg_set(i8086 *cpu, uint reg, uint value)
+{
+
+	switch (reg) {
+
+		case REG_CS: memselect(cpu, REG_CS, value); break;
+		case REG_DS: memselect(cpu, REG_DS, value); break;
+		case REG_ES: memselect(cpu, REG_ES, value); break;
+		case REG_SS: memselect(cpu, REG_SS, value); break;
+
+		case REG_IP: cpu->regs.ip = value; break;
+
+		case REG_AX: cpu->regs.ax.w = value; break;
+		case REG_BX: cpu->regs.bx.w = value; break;
+		case REG_CX: cpu->regs.cx.w = value; break;
+		case REG_DX: cpu->regs.dx.w = value; break;
+
+		case REG_AL: cpu->regs.ax.l = value; break;
+		case REG_BL: cpu->regs.bx.l = value; break;
+		case REG_CL: cpu->regs.cx.l = value; break;
+		case REG_DL: cpu->regs.dx.l = value; break;
+
+		case REG_AH: cpu->regs.ax.h = value; break;
+		case REG_BH: cpu->regs.bx.h = value; break;
+		case REG_CH: cpu->regs.cx.h = value; break;
+		case REG_DH: cpu->regs.dx.h = value; break;
+
+		case REG_SI: cpu->regs.si.w = value; break;
+		case REG_DI: cpu->regs.di.w = value; break;
+		case REG_BP: cpu->regs.bp.w = value; break;
+		case REG_SP: cpu->regs.sp.w = value; break;
+
+		case REG_FLAGS: setf_w(cpu, value);     break;
+		case REG_ZERO:  cpu->regs.zero = value; break;
+
+		case REG_SHADOW_CS: cpu->regs.scs = value; break;
+		case REG_SHADOW_IP: cpu->regs.sip = value; break;
+
+	}
+
+}
+
+
+
+static void op_divrmb(CPU)
+{
+
+	const ureg tmp = LDEAR1MB();
 
 	if (tmp == 0)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
 
-	const aluu div = cpu->regs.ax.w / (u8)tmp;
-	const aluu mod = cpu->regs.ax.w % (u8)tmp;
+	const ureg div = cpu->regs.ax.w / (u8)tmp;
+	const ureg mod = cpu->regs.ax.w % (u8)tmp;
 
 	if (div > 255)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
 
 	cpu->regs.ax.l = div;
 	cpu->regs.ax.h = mod;
@@ -1669,20 +1395,20 @@ void op_divrmb(CPU)
 
 
 
-void op_divrmw(CPU)
+static void op_divrmw(CPU)
 {
 
-	const aluu tmp = LDEAR1MW();
+	const ureg tmp = LDEAR1MW();
 
 	if (tmp == 0)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
 
-	const aluu num = cpu->regs.dx.w * 65536 + cpu->regs.ax.w;
-	const aluu div = num / (u16)tmp;
-	const aluu mod = num % (u16)tmp;
+	const ureg num = cpu->regs.dx.w * 65536 + cpu->regs.ax.w;
+	const ureg div = num / (u16)tmp;
+	const ureg mod = num % (u16)tmp;
 
 	if (div > 65535)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
 
 	cpu->regs.ax.w = div;
 	cpu->regs.dx.w = mod;
@@ -1691,86 +1417,10 @@ void op_divrmw(CPU)
 
 
 
-void op_idivrmb(CPU)
+static void op_mulrmb(CPU)
 {
 
-	const i8 tmp = (i8)LDEAR1MB();
-
-	if (tmp == 0)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
-
-	const i16 num = (i16)cpu->regs.ax.w;
-	const i16 div = num / tmp;
-	const i16 mod = num % tmp;
-
-	if (div <= -128 || div > 127)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
-
-	cpu->regs.ax.l = div;
-	cpu->regs.ax.h = mod;
-
-}
-
-
-
-void op_idivrmw(CPU)
-{
-
-	const i16 tmp = (i16)LDEAR1MW();
-
-	if (tmp == 0)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
-
-	const i32 num = (i32)((u32)(cpu->regs.dx.w << 16) + cpu->regs.ax.w);
-	const i32 div = num / tmp;
-	const i32 mod = num % tmp;
-
-	if (div <= -32768 || div > 32767)
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
-
-	cpu->regs.ax.w = div;
-	cpu->regs.dx.w = mod;
-
-}
-
-
-
-void op_imulrmb(CPU)
-{
-
-	aluu tmp = (i8)LDEAR1MB();
-
-	tmp *= (i8)cpu->regs.ax.l;
-
-	cpu->regs.ax.w = tmp;
-
-	cpu->flags.c = (i8)cpu->regs.ax.l != tmp;
-	cpu->flags.v = cpu->flags.c;
-
-}
-
-
-
-void op_imulrmw(CPU)
-{
-
-	aluu tmp = (i16)LDEAR1MW();
-
-	tmp *= (i16)cpu->regs.ax.w;
-
-	cpu->regs.ax.w = (tmp >> 0)  & 0xffff;
-	cpu->regs.dx.w = (tmp >> 16) & 0xffff;
-
-	cpu->flags.c = (i16)cpu->regs.ax.w != tmp;
-	cpu->flags.v = cpu->flags.c;
-
-}
-
-
-void op_mulrmb(CPU)
-{
-
-	aluu tmp = LDEAR1MB();
+	ureg tmp = LDEAR1MB();
 
 	cpu->regs.ax.w = cpu->regs.ax.l * tmp;
 
@@ -1781,10 +1431,10 @@ void op_mulrmb(CPU)
 
 
 
-void op_mulrmw(CPU)
+static void op_mulrmw(CPU)
 {
 
-	aluu tmp = LDEAR1MW();
+	ureg tmp = LDEAR1MW();
 
 	tmp *= cpu->regs.ax.w;
 
@@ -1798,73 +1448,85 @@ void op_mulrmw(CPU)
 
 
 
-void op_negrmb(CPU) { aluu tmp = LDEAR1MB(); tmp = sub8( cpu, 0, tmp); STEAR1MB(tmp); }
-void op_negrmw(CPU) { aluu tmp = LDEAR1MW(); tmp = sub16(cpu, 0, tmp); STEAR1MW(tmp); }
-
-
-void op_tstaib(CPU) {                  and8(cpu, cpu->regs.ax.l, (u8)cpu->insn.imm0); }
-void op_tstaiw(CPU) {                  and16(cpu, cpu->regs.ax.w, (u16)cpu->insn.imm0); }
-
-void op_notrmb(CPU) { aluu tmp = LDEAR1MB(); tmp = ~tmp; STEAR1MB(tmp); }
-void op_notrmw(CPU) { aluu tmp = LDEAR1MW(); tmp = ~tmp; STEAR1MW(tmp); }
-
-void op_tstrib(CPU)
+static void op_idivrmb(CPU)
 {
 
-	aluu tmp, arg0;
+	const i8 tmp = (i8)LDEAR1MB();
 
-	// Manually fetch first immediate operand
-	arg0 = bus_read8(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip);
-	cpu->regs.ip++;
+	if (tmp == 0)
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
 
-	if (cpu->insn.op_memory) tmp = bus_read8(&cpu->mem, cpu->insn.addr);
-	else                     tmp = *cpu->insn.reg1b;
+	const i16 num = (i16)cpu->regs.ax.w;
+	const i16 div = num / tmp;
+	const i16 mod = num % tmp;
 
-	and8(cpu, tmp, arg0);
+	if (div <= -128 || div > 127)
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
+
+	cpu->regs.ax.l = div;
+	cpu->regs.ax.h = mod;
 
 }
 
 
 
-void op_tstriw(CPU)
+static void op_idivrmw(CPU)
 {
 
-	aluu tmp, arg0;
+	const i16 tmp = (i16)LDEAR1MW();
 
-	// Manually fetch first immediate operand
-	arg0          = bus_read16(&cpu->mem, cpu->regs.cs * 16 + cpu->regs.ip);
-	cpu->regs.ip += 2;
+	if (tmp == 0)
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
 
-	if (cpu->insn.op_memory) tmp = bus_read16(&cpu->mem, cpu->insn.addr);
-	else                     tmp = *cpu->insn.reg1w;
+	const i32 num = (i32)((u32)(cpu->regs.dx.w << 16) + cpu->regs.ax.w);
+	const i32 div = num / tmp;
+	const i32 mod = num % tmp;
 
-	and16(cpu, tmp, arg0);
+	if (div <= -32768 || div > 32767)
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
+
+	cpu->regs.ax.w = div;
+	cpu->regs.dx.w = mod;
 
 }
 
 
 
-void op_tstrmb(CPU)
+static void op_imulrmb(CPU)
 {
-	if (cpu->insn.op_memory) and8(cpu, bus_read8(&cpu->mem, cpu->insn.addr), *cpu->insn.reg0b);
-	else                     and8( cpu, *cpu->insn.reg1b, *cpu->insn.reg0b);
+
+	ureg tmp = (i8)LDEAR1MB();
+
+	tmp *= (i8)cpu->regs.ax.l;
+
+	cpu->regs.ax.w = tmp;
+
+	cpu->flags.c = (i8)cpu->regs.ax.l != tmp;
+	cpu->flags.v = cpu->flags.c;
+
 }
 
 
 
-void op_tstrmw(CPU)
+static void op_imulrmw(CPU)
 {
-	if (cpu->insn.op_memory) and16(cpu, bus_read16(&cpu->mem, cpu->insn.addr), *cpu->insn.reg0w);
-	else                     and16( cpu, *cpu->insn.reg1w, *cpu->insn.reg0w);
+
+	ureg tmp = (i16)LDEAR1MW();
+
+	tmp *= (i16)cpu->regs.ax.w;
+
+	cpu->regs.ax.w = (tmp >> 0)  & 0xffff;
+	cpu->regs.dx.w = (tmp >> 16) & 0xffff;
+
+	cpu->flags.c = (i16)cpu->regs.ax.w != tmp;
+	cpu->flags.v = cpu->flags.c;
+
 }
 
 
 
 
-
-
-
-void op_aaa(CPU)
+static void op_aaa(CPU)
 {
 
 	if (((cpu->regs.ax.l & 0x0f) > 9) || cpu->flags.a) {
@@ -1888,7 +1550,7 @@ void op_aaa(CPU)
 
 
 
-void op_aas(CPU)
+static void op_aas(CPU)
 {
 
 	if (((cpu->regs.ax.l & 0x0f) > 9) || cpu->flags.a) {
@@ -1912,55 +1574,44 @@ void op_aas(CPU)
 
 
 
-void op_aad(CPU)
+static void op_aad(CPU)
 {
 
-        cpu->regs.ax.l = cpu->regs.ax.l + cpu->regs.ax.h * cpu->insn.imm0;
+	const u8 imm = LDIPUB();
+
+        cpu->regs.ax.l = cpu->regs.ax.l + cpu->regs.ax.h * imm;
 	cpu->regs.ax.h = 0;
 
-	cpu->flags.p = parity(cpu->regs.ax.l);
-	cpu->flags.z = zero(cpu->regs.ax.l, 0x80);
-	cpu->flags.s = sign(cpu->regs.ax.l, 0x80);
+	setf_pzs(cpu, 8, cpu->regs.ax.l);
 
 }
 
 
 
-void op_aam(CPU)
+static void op_aam(CPU)
 {
 
-	if (cpu->insn.imm0 == 0) {
+	const u8 imm = LDIPUB();
 
-		cpu->flags.c = false;
-		cpu->flags.v = false;
-		cpu->flags.p = true;
-		cpu->flags.a = false;
-		cpu->flags.z = true;
-		cpu->flags.s = false;
+	if (imm == 0) {
 
-		return i8086_interrupt(cpu, I8086_VECTOR_DIVERR);
+		setf_log(cpu, 8, 0);
+		return interrupt(cpu, I8086_VECTOR_DIVERR, SEGMENT(REG_CS), cpu->regs.ip);
 
 	}
 
-	const aluu tmp = cpu->regs.ax.l;
+	const ureg tmp = cpu->regs.ax.l;
 
-	cpu->regs.ax.l = tmp % (u8)cpu->insn.imm0;
-	cpu->regs.ax.h = tmp / (u8)cpu->insn.imm0;
+	cpu->regs.ax.l = tmp % imm;
+	cpu->regs.ax.h = tmp / imm;
 
-	cpu->flags.p = parity(cpu->regs.ax.l);
-	cpu->flags.z = zero(cpu->regs.ax.l, 0x80);
-	cpu->flags.s = sign(cpu->regs.ax.l, 0x80);
+	setf_pzs(cpu, 8, cpu->regs.ax.l);
 
 }
 
 
 
-void op_cbw(CPU) { cpu->regs.ax.w = (i8)cpu->regs.ax.l; }
-void op_cwd(CPU) { cpu->regs.dx.w = sign(cpu->regs.ax.w, 0x8000)? 0xffff: 0x0000; }
-
-
-
-void op_daa(CPU)
+static void op_daa(CPU)
 {
 
 	const bool carry = cpu->regs.ax.l > (cpu->flags.a? 0x9f: 0x99);
@@ -1978,15 +1629,13 @@ void op_daa(CPU)
 
 	}
 
-	cpu->flags.p = parity(cpu->regs.ax.l);
-	cpu->flags.z = zero(cpu->regs.ax.l, 0x80);
-	cpu->flags.s = sign(cpu->regs.ax.l, 0x80);
+	setf_pzs(cpu, 8, cpu->regs.ax.l);
 
 }
 
 
 
-void op_das(CPU)
+static void op_das(CPU)
 {
 
 	const bool carry = cpu->regs.ax.l > (cpu->flags.a? 0x9f: 0x99);
@@ -2004,276 +1653,26 @@ void op_das(CPU)
 
 	}
 
-	cpu->flags.p = parity(cpu->regs.ax.l);
-	cpu->flags.z = zero(cpu->regs.ax.l, 0x80);
-	cpu->flags.s = sign(cpu->regs.ax.l, 0x80);
+	setf_pzs(cpu, 8, cpu->regs.ax.l);
 
 }
 
 
 
-void op_lahf(CPU) { cpu->regs.ax.h = (u8)cpu->flags.w | 0x02; }
-
-
-
-void op_ldsr(CPU)
-{
-
-	if (!cpu->insn.op_memory)
-		return op_undef(cpu);
-
-	*cpu->insn.reg0w = bus_read16(&cpu->mem, cpu->insn.addr + 0);
-	cpu->regs.ds     = bus_read16(&cpu->mem, cpu->insn.addr + 2);
-
-}
-
-
-
-void op_lesr(CPU)
-{
-
-	if (!cpu->insn.op_memory)
-		return op_undef(cpu);
-
-	*cpu->insn.reg0w = bus_read16(&cpu->mem, cpu->insn.addr + 0);
-	cpu->regs.es     = bus_read16(&cpu->mem, cpu->insn.addr + 2);
-
-}
-
-
-
-void op_lear(CPU)
-{
-
-	if (!cpu->insn.op_memory)
-		return op_undef(cpu);
-
-	*cpu->insn.reg0w = cpu->insn.addr;
-
-}
-
-
-
-
-void op_sahf(CPU) {
-	cpu->flags.w = (cpu->flags.w & 0xff00) | (cpu->regs.ax.h & 0xd5) | 0x02;
-}
-
-
-
-void op_xcharw(CPU)
-{
-	aluu tmp = cpu->regs.ax.w;
-	cpu->regs.ax.w   = *cpu->insn.reg0w;
-	*cpu->insn.reg0w = tmp;
-}
-
-
-
-void op_xchrmb(CPU)
-{
-
-	aluu tmp;
-
-	if (cpu->insn.op_memory) {
-
-		tmp = bus_read8(&cpu->mem, cpu->insn.addr);
-		bus_write8(&cpu->mem, cpu->insn.addr, *cpu->insn.reg0b);
-
-	} else {
-
-		tmp = *cpu->insn.reg1b;
-		*cpu->insn.reg1b = *cpu->insn.reg0b;
-
-	}
-
-	*cpu->insn.reg0b = tmp;
-
-}
-
-
-
-void op_xchrmw(CPU)
-{
-
-	uint tmp;
-
-	if (cpu->insn.op_memory) {
-
-		tmp = bus_read16(&cpu->mem, cpu->insn.addr);
-		bus_write16(&cpu->mem, cpu->insn.addr, *cpu->insn.reg0w);
-
-	} else {
-
-		tmp = *cpu->insn.reg1w;
-		*cpu->insn.reg1w = *cpu->insn.reg0w;
-
-	}
-
-	*cpu->insn.reg0w = tmp;
-
-}
-
-
-
-void op_xlatab(CPU)
-{
-	u32 addr = *get_rs(cpu, cpu->insn.segment) * 16 + ((cpu->regs.bx.w + cpu->regs.ax.l) & 0xffffu);
-	cpu->regs.ax.l = bus_read8(&cpu->mem, addr);
-
-}
-
-
-
-void op_popcs( CPU) { ADVSP(+2); cpu->regs.cs     = LDSPW(-2);  }
-void op_popds( CPU) { ADVSP(+2); cpu->regs.ds     = LDSPW(-2);  }
-void op_popes( CPU) { ADVSP(+2); cpu->regs.es     = LDSPW(-2);  }
-void op_popss( CPU) { ADVSP(+2); cpu->regs.ss     = LDSPW(-2);  }
-void op_popfw( CPU) { ADVSP(+2); cpu->flags.w     = (LDSPW(-2) & 0x0ed5) | 0xf002; }
-void op_poprw( CPU) { ADVSP(+2); *cpu->insn.reg0w = LDSPW(-2); }
-void op_poprmw(CPU) { ADVSP(+2); aluu tmp = LDSPW(-2); STEAR1MW(tmp); }
-
-void op_pushcs(CPU)  { ADVSP(-2); STSPW(0, cpu->regs.cs); }
-void op_pushds(CPU)  { ADVSP(-2); STSPW(0, cpu->regs.ds); }
-void op_pushes(CPU)  { ADVSP(-2); STSPW(0, cpu->regs.es); }
-void op_pushss(CPU)  { ADVSP(-2); STSPW(0, cpu->regs.ss); }
-void op_pushsp(CPU)  { ADVSP(-2); STSPW(0, cpu->regs.sp.w); }
-void op_pushfw(CPU)  { ADVSP(-2); STSPW(0, cpu->flags.w | 0x0002); }
-void op_pushrw(CPU)  { ADVSP(-2); STSPW(0, *cpu->insn.reg0w); }
-void op_pushrmw(CPU) { ADVSP(-2); aluu tmp = LDEAR1MW(); STSPW(0, tmp); }
-
-void op_callf(CPU) { ADVSP(-4); STSPW(2, cpu->regs.cs); STSPW(0, cpu->regs.ip); cpu->regs.ip  = cpu->insn.imm0; cpu->regs.cs = cpu->insn.imm1; }
-void op_calln(CPU) { ADVSP(-2); STSPW(0, cpu->regs.ip);                         cpu->regs.ip += cpu->insn.imm0; }
-
-
-
-void op_callfrm(CPU)
-{
-
-	if (!cpu->insn.op_memory)
-		op_undef(cpu);
-
-	aluu tip = bus_read16(&cpu->mem, cpu->insn.addr + 0);
-	aluu tcs = bus_read16(&cpu->mem, cpu->insn.addr + 2);
-
-	ADVSP(-4);
-	STSPW(2, cpu->regs.cs);
-	STSPW(0, cpu->regs.ip);
-
-	cpu->regs.ip = tip;
-	cpu->regs.cs = tcs;
-
-}
-
-
-
-void op_callnrm(CPU) { aluu tmp = LDEAR1MW(); ADVSP(-2); STSPW(0, cpu->regs.ip); cpu->regs.ip = tmp; }
-
-void op_int3(CPU)  { i8086_interrupt(cpu, I8086_VECTOR_BREAK); }
-void op_into(CPU)  { if (cpu->flags.v) i8086_interrupt(cpu, I8086_VECTOR_VFLOW); }
-void op_intib(CPU) { i8086_interrupt(cpu, cpu->insn.imm0); }
-
-void op_iret(CPU) { ADVSP(+4); cpu->regs.ip = LDSPW(-4); cpu->regs.cs = LDSPW(-2); op_popfw(cpu); }
-
-void op_jcbe(CPU) { if (cpu->flags.c                 || cpu->flags.z) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcle(CPU) { if (cpu->flags.s != cpu->flags.v || cpu->flags.z) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcl(CPU)  { if (cpu->flags.s != cpu->flags.v)                 cpu->regs.ip += cpu->insn.imm0; }
-
-void op_jcc(CPU) { if (cpu->flags.c) cpu->regs.ip += cpu->insn.imm0; }
-void op_jco(CPU) { if (cpu->flags.v) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcp(CPU) { if (cpu->flags.p) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcs(CPU) { if (cpu->flags.s) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcz(CPU) { if (cpu->flags.z) cpu->regs.ip += cpu->insn.imm0; }
-
-void op_jcnbe(CPU) { if (!cpu->flags.c                && !cpu->flags.z) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcnle(CPU) { if (cpu->flags.s == cpu->flags.v && !cpu->flags.z) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcnl(CPU)  { if (cpu->flags.s == cpu->flags.v)                  cpu->regs.ip += cpu->insn.imm0; }
-
-void op_jcnc(CPU) { if (!cpu->flags.c) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcno(CPU) { if (!cpu->flags.v) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcnp(CPU) { if (!cpu->flags.p) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcns(CPU) { if (!cpu->flags.s) cpu->regs.ip += cpu->insn.imm0; }
-void op_jcnz(CPU) { if (!cpu->flags.z) cpu->regs.ip += cpu->insn.imm0; }
-
-void op_jcxzr(CPU) { if (!cpu->regs.cx.w)  cpu->regs.ip += cpu->insn.imm0; }
-
-void op_jmpf(CPU) { cpu->regs.ip  = cpu->insn.imm0; cpu->regs.cs = cpu->insn.imm1; }
-void op_jmpn(CPU) { cpu->regs.ip += cpu->insn.imm0; }
-
-void op_jmpfrm(CPU)
-{
-
-	if (!cpu->insn.op_memory)
-		op_undef(cpu);
-
-	cpu->regs.ip = bus_read16(&cpu->mem, cpu->insn.addr + 0);
-	cpu->regs.cs = bus_read16(&cpu->mem, cpu->insn.addr + 2);
-
-}
-
-void op_jmpnrm(CPU) { cpu->regs.ip = LDEAR1MW(); }
-
-void op_loopnzr(CPU) { if (--cpu->regs.cx.w && !cpu->flags.z) cpu->regs.ip += cpu->insn.imm0; }
-void op_loopzr(CPU)  { if (--cpu->regs.cx.w && cpu->flags.z)  cpu->regs.ip += cpu->insn.imm0; }
-void op_loopr(CPU)   { if (--cpu->regs.cx.w)                  cpu->regs.ip += cpu->insn.imm0; }
-
-void op_retf(CPU) { ADVSP(+4); cpu->regs.ip = LDSPW(-4); cpu->regs.cs = LDSPW(-2); ADVSP(cpu->insn.imm0); }
-void op_retn(CPU) { ADVSP(+2); cpu->regs.ip = LDSPW(-2);                           ADVSP(cpu->insn.imm0); }
-
-void op_inib(CPU) { cpu->regs.ax.l = bus_read8( &cpu->io, cpu->insn.imm0 & 0xff); }
-void op_iniw(CPU) { cpu->regs.ax.w = bus_read16(&cpu->io, cpu->insn.imm0 & 0xff); }
-void op_inrb(CPU) { cpu->regs.ax.l = bus_read8( &cpu->io, cpu->regs.dx.w); }
-void op_inrw(CPU) { cpu->regs.ax.w = bus_read16(&cpu->io, cpu->regs.dx.w); }
-
-void op_outib(CPU) { bus_write8( &cpu->io, cpu->insn.imm0 & 0xff, cpu->regs.ax.l); }
-void op_outiw(CPU) { bus_write16(&cpu->io, cpu->insn.imm0 & 0xff, cpu->regs.ax.w); }
-void op_outrb(CPU) { bus_write8( &cpu->io, cpu->regs.dx.w, cpu->regs.ax.l); }
-void op_outrw(CPU) { bus_write16(&cpu->io, cpu->regs.dx.w, cpu->regs.ax.w); }
-
-void op_seges(CPU) { cpu->insn.segment = 0; }
-void op_segcs(CPU) { cpu->insn.segment = 1; }
-void op_segss(CPU) { cpu->insn.segment = 2; }
-void op_segds(CPU) { cpu->insn.segment = 3; }
-void op_repne(CPU) { cpu->insn.repeat_eq = false; cpu->insn.repeat_ne = true;  }
-void op_repeq(CPU) { cpu->insn.repeat_eq = true;  cpu->insn.repeat_ne = false; }
-
-void op_lock(CPU)  { /* FIXME: Not implemented */ }
-void op_wait(CPU)  { /* FIXME: Not implemented */ }
-
-void op_clc(CPU) { cpu->flags.c = false; }
-void op_stc(CPU) { cpu->flags.c = true;  }
-void op_cli(CPU) { cpu->flags.i = false; }
-void op_cmc(CPU) { cpu->flags.c = !cpu->flags.c; }
-void op_sti(CPU) { cpu->flags.i = true;  }
-void op_cld(CPU) { cpu->flags.d = false; }
-void op_std(CPU) { cpu->flags.d = true;  }
-
-
-
-void op_cmpsb(CPU)
+static void op_cmpsb(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32  addr = *get_rs(cpu, cpu->insn.segment) * 16 + cpu->regs.si.w;
-	uint tmpa = bus_read8(&cpu->mem, addr);
-	uint tmpb = bus_read8(&cpu->mem, cpu->regs.es * 16 + cpu->regs.di.w);
+	const ureg tmpa = LDMB(cpu->insn.segment, cpu->regs.si.w);
+	const ureg tmpb = LDMB(REG_ES,            cpu->regs.di.w);
 
 	sub8(cpu, tmpa, tmpb);
+	ADVSIB();
+	ADVDIB();
 
-	if (cpu->flags.d) {
-
-		cpu->regs.si.w--;
-		cpu->regs.di.w--;
-
-	} else {
-
-		cpu->regs.si.w++;
-		cpu->regs.di.w++;
-	}
-
-	cpu->insn.complete =
+	cpu->insn.fetch =
 		cpu->insn.repeat_eq? (--cpu->regs.cx.w == 0) || !cpu->flags.z:
 		cpu->insn.repeat_ne? (--cpu->regs.cx.w == 0) || cpu->flags.z:
 		true;
@@ -2282,30 +1681,20 @@ void op_cmpsb(CPU)
 
 
 
-void op_cmpsw(CPU)
+static void op_cmpsw(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32  addr = *get_rs(cpu, cpu->insn.segment) * 16 + cpu->regs.si.w;
-	uint tmpa = bus_read16(&cpu->mem, addr);
-	uint tmpb = bus_read16(&cpu->mem, cpu->regs.es * 16 + cpu->regs.di.w);
+	const ureg tmpa = LDMW(cpu->insn.segment, cpu->regs.si.w);
+	const ureg tmpb = LDMW(REG_ES,            cpu->regs.di.w);
 
 	sub16(cpu, tmpa, tmpb);
+	ADVSIW();
+	ADVDIW();
 
-	if (cpu->flags.d) {
-
-		cpu->regs.si.w -= 2;
-		cpu->regs.di.w -= 2;
-
-	} else {
-
-		cpu->regs.si.w += 2;
-		cpu->regs.di.w += 2;
-	}
-
-	cpu->insn.complete =
+	cpu->insn.fetch =
 		cpu->insn.repeat_eq? (--cpu->regs.cx.w == 0) || !cpu->flags.z:
 		cpu->insn.repeat_ne? (--cpu->regs.cx.w == 0) || cpu->flags.z:
 		true;
@@ -2314,179 +1703,126 @@ void op_cmpsw(CPU)
 
 
 
-void op_lodsb(CPU)
+static void op_lodsb(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32 addr = *get_rs(cpu, cpu->insn.segment) * 16 + cpu->regs.si.w;
-	cpu->regs.ax.l = bus_read8(&cpu->mem, addr);
+	cpu->regs.ax.l = LDMB(cpu->insn.segment, cpu->regs.si.w);
+	ADVSIB();
 
-	if (cpu->flags.d) cpu->regs.si.w--;
-	else              cpu->regs.si.w++;
-
-	cpu->insn.complete = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
+	cpu->insn.fetch = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
 
 }
 
 
 
-void op_lodsw(CPU)
+static void op_lodsw(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32 addr = *get_rs(cpu, cpu->insn.segment) * 16 + cpu->regs.si.w;
-	cpu->regs.ax.w = bus_read16(&cpu->mem, addr);
+	cpu->regs.ax.w = LDMW(cpu->insn.segment, cpu->regs.si.w);
 
-	if (cpu->flags.d) cpu->regs.si.w -= 2;
-	else              cpu->regs.si.w += 2;
+	ADVSIW();
 
-	cpu->insn.complete = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
+	cpu->insn.fetch = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
 
 }
 
 
 
-void op_movsb(CPU)
+static void op_movsb(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32  addr = *get_rs(cpu, cpu->insn.segment) * 16 + cpu->regs.si.w;
-	aluu tmp  = bus_read8(&cpu->mem, addr);
+	STMB(REG_ES, cpu->regs.di.w, LDMB(cpu->insn.segment, cpu->regs.si.w));
+	ADVSIB();
+	ADVDIB();
 
-	bus_write8(&cpu->mem, cpu->regs.es * 16 + cpu->regs.di.w, tmp);
-
-	if (cpu->flags.d) {
-
-		cpu->regs.si.w--;
-		cpu->regs.di.w--;
-
-	} else {
-
-		cpu->regs.si.w++;
-		cpu->regs.di.w++;
-	}
-
-	cpu->insn.complete = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
+	cpu->insn.fetch = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
 
 }
 
 
 
-void op_movsw(CPU)
+static void op_movsw(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32  addr = *get_rs(cpu, cpu->insn.segment) * 16 + cpu->regs.si.w;
-	aluu tmp  = bus_read16(&cpu->mem, addr);
+	STMW(REG_ES, cpu->regs.di.w, LDMW(cpu->insn.segment, cpu->regs.si.w));
+	ADVSIW();
+	ADVDIW();
 
-	bus_write16(&cpu->mem, cpu->regs.es * 16 + cpu->regs.di.w, tmp);
-
-	if (cpu->flags.d) {
-
-		cpu->regs.si.w -= 2;
-		cpu->regs.di.w -= 2;
-
-	} else {
-
-		cpu->regs.si.w += 2;
-		cpu->regs.di.w += 2;
-	}
-
-	cpu->insn.complete = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
+	cpu->insn.fetch = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
 
 }
 
 
 
-void op_scasb(CPU)
+static void op_scasb(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32 addr = cpu->regs.es * 16 + cpu->regs.di.w;
-	sub8(cpu, cpu->regs.ax.l, bus_read8(&cpu->mem, addr));
+	sub8(cpu, cpu->regs.ax.l, LDMB(REG_ES, cpu->regs.di.w));
+	ADVDIB();
 
-	if (cpu->flags.d) cpu->regs.di.w--;
-	else              cpu->regs.di.w++;
-
-	if      (cpu->insn.repeat_eq) { cpu->insn.complete = (--cpu->regs.cx.w == 0) || !cpu->flags.z; }
-	else if (cpu->insn.repeat_ne) { cpu->insn.complete = (--cpu->regs.cx.w == 0) ||  cpu->flags.z; }
+	if      (cpu->insn.repeat_eq) { cpu->insn.fetch = (--cpu->regs.cx.w == 0) || !cpu->flags.z; }
+	else if (cpu->insn.repeat_ne) { cpu->insn.fetch = (--cpu->regs.cx.w == 0) ||  cpu->flags.z; }
 
 }
 
 
 
-void op_scasw(CPU)
+static void op_scasw(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	u32 addr = cpu->regs.es * 16 + cpu->regs.di.w;
-	sub16(cpu, cpu->regs.ax.w, bus_read16(&cpu->mem, addr));
+	sub16(cpu, cpu->regs.ax.w, LDMW(REG_ES, cpu->regs.di.w));
+	ADVDIW();
 
-	if (cpu->flags.d) cpu->regs.di.w -= 2;
-	else              cpu->regs.di.w += 2;
-
-	if      (cpu->insn.repeat_eq) { cpu->insn.complete = (--cpu->regs.cx.w == 0) || !cpu->flags.z; }
-	else if (cpu->insn.repeat_ne) { cpu->insn.complete = (--cpu->regs.cx.w == 0) ||  cpu->flags.z; }
+	if      (cpu->insn.repeat_eq) { cpu->insn.fetch = (--cpu->regs.cx.w == 0) || !cpu->flags.z; }
+	else if (cpu->insn.repeat_ne) { cpu->insn.fetch = (--cpu->regs.cx.w == 0) ||  cpu->flags.z; }
 
 }
 
 
 
-void op_stosb(CPU)
+static void op_stosb(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	bus_write8(&cpu->mem, cpu->regs.es * 16 + cpu->regs.di.w, cpu->regs.ax.l);
+	STMB(REG_ES, cpu->regs.di.w, cpu->regs.ax.l);
+	ADVDIB();
 
-	if (cpu->flags.d) cpu->regs.di.w--;
-	else              cpu->regs.di.w++;
-
-	cpu->insn.complete = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
+	cpu->insn.fetch = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
 
 }
 
 
 
-void op_stosw(CPU)
+static void op_stosw(CPU)
 {
 
 	if ((cpu->insn.repeat_eq || cpu->insn.repeat_ne) && (cpu->regs.cx.w == 0))
 		return;
 
-	bus_write16(&cpu->mem, cpu->regs.es * 16 + cpu->regs.di.w, cpu->regs.ax.w);
+	STMW(REG_ES, cpu->regs.di.w, cpu->regs.ax.w);
+	ADVDIW();
 
-	if (cpu->flags.d) cpu->regs.di.w -= 2;
-	else              cpu->regs.di.w += 2;
-
-	cpu->insn.complete = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
+	cpu->insn.fetch = !(cpu->insn.repeat_eq || cpu->insn.repeat_ne) || (--cpu->regs.cx.w == 0);
 
 }
-
-
-
-void op_undef(CPU)
-{
-
-	i8086_undef(cpu);
-
-}
-
-
-
-void op_group(CPU) { }
-void op_nop(CPU)   { }
 

@@ -5,6 +5,28 @@
 
 
 enum {
+
+	REG_CS = 1, REG_DS = 3, REG_ES = 0, REG_SS = 2,
+
+	REG_ZERO = 4,
+	REG_IP   = 7,
+
+	REG_AX = 8,  REG_BX = 11, REG_CX =  9, REG_DX = 10,
+	REG_AL = 16, REG_BL = 19, REG_CL = 17, REG_DL = 18,
+	REG_AH = 20, REG_BH = 23, REG_CH = 21, REG_DH = 22,
+
+	REG_SI = 14, REG_DI = 15,
+	REG_BP = 13, REG_SP = 12,
+
+	REG_FLAGS = 32,
+
+	REG_SHADOW_CS = 33,
+	REG_SHADOW_IP = 34
+
+};
+
+
+enum {
 	I8086_VECTOR_DIVERR = 0,
 	I8086_VECTOR_SSTEP  = 1,
 	I8086_VECTOR_NMI    = 2,
@@ -24,46 +46,68 @@ typedef union {
 } i8086_reg;
 
 
-struct i8086 {
+struct i8086;
+
+
+typedef void (*i8086_opcode)(struct i8086 *cpu);
+
+
+typedef struct i8086 {
 
 	// CPU register state
 	struct {
 
-		u16 scs;
-		u16 ip, sip;
-		u16 es, cs, ss, ds;
+		u16 zero;
+		u16 scs, sip;
+		u16 ip;
+		//u16 es, cs, ss, ds, zs;
 
-		i8086_reg ax, cx, dx, bx;
-		i8086_reg sp, bp, si, di;
+		i8086_reg ax, bx, cx, dx;
+		i8086_reg si, di, bp, sp;
 
 	} regs;
 
 
 	// CPU status flags
-	union {
+	struct {
+
+		bool c;  // Carry
+		bool p;  // Parity
+		bool a;  // Aux carry
+		bool z;  // Zero
+		bool s;  // Sign
+		bool v;  // Overflow
+
+		bool d;  // Direction
+		bool t;  // Trap
+		bool i;  // Interrupt
+
+	} flags;
+
+
+	// CPU microcode
+	struct {
+
+		//i8086_opcode uops[352];
+		//uint         mods[352];
 
 		struct {
 
-			unsigned c:  1;  // Carry
-			unsigned:    1;
-			unsigned p:  1;  // Parity
-			unsigned:    1;
+			bool memory;
 
-			unsigned a:  1;  // Aux carry
-			unsigned:    1;
-			unsigned z:  1;  // Zero
-			unsigned s:  1;  // Sign
+			uint  ea_seg;
+			u16  *ea_reg0;
+			u16  *ea_reg1;
+			bool  ea_disp8;
+			bool  ea_disp16;
 
-			unsigned t:  1;  // Trap
-			unsigned i:  1;  // Interrupt
-			unsigned d:  1;  // Direction
-			unsigned v:  1;  // Overflow
+			u8  *regb;
+			u16 *regw;
+			u16 *regs;
 
-		};
+		} demodrm[32];
 
-		u16 w;
-
-	} flags;
+	} microcode;
 
 
 	// Interrupt state
@@ -71,8 +115,9 @@ struct i8086 {
 
 		uint irq;
 
-		bool irq_act: 1;
-		bool nmi_act: 1;
+		bool irq_act;
+		bool nmi_act;
+		bool delay;
 
 	} interrupt;
 
@@ -80,31 +125,19 @@ struct i8086 {
 	// Instruction decoder state
 	struct {
 
-		bool fetch_opcode:   1;
-		bool fetch_modrm:    1;
-		bool fetch_simm8a:   1;
-		bool fetch_uimm16a:  1;
-		bool fetch_simm8b:   1;
-		bool fetch_uimm16b:  1;
-		bool compute_eaimm0: 1;
-		bool compute_easeg:  1;
-		bool compute_neaseg: 1; // LEA hack
-		bool repeat_eq:      1;
-		bool repeat_ne:      1;
-		bool complete:       1;
+		bool fetch;
+		bool repeat_eq;
+		bool repeat_ne;
 
-		bool op_wide:     1;
-		bool op_rseg:     1;
-		bool op_group:    1;
-		bool op_override: 1;
-		bool op_memory:   1;
+		bool op_override;
+		bool op_memory;
+		bool op_segment;
 
 		uint opcode;
 		uint modrm;
 		uint segment;
 
 		u32 addr;
-		u16 imm0, imm1;
 
 		u8  *reg0b, *reg1b;
 		u16 *reg0w, *reg1w;
@@ -112,34 +145,42 @@ struct i8086 {
 	} insn;
 
 
-	struct bus io;
-	struct bus mem;
+	// Memory interface
+	struct {
 
-};
+		struct memory mem;
 
+		u16           selector[5];
+		struct memory descriptor[5];
 
-
-void i8086_init(struct i8086 *cpu);
-void i8086_reset(struct i8086 *cpu);
-int  i8086_intrq(struct i8086 *cpu, uint nmi, uint irq);
-void i8086_interrupt(struct i8086 *cpu, uint irq);
-void i8086_tick(struct i8086 *cpu);
-void i8086_dump(struct i8086 *cpu);
-
-extern void i8086_undef(struct i8086 *cpu);
+	} memory;
 
 
-static inline struct wire i8086_irq(struct i8086 *cpu) {
-	struct wire w = MKWIRE(&i8086_intrq, cpu, 0);
-	return w;
+	struct io iob;
+	struct io iow;
+
+	i8086_opcode undef;
+
+} i8086;
+
+
+
+void i8086_init( i8086 *cpu);
+void i8086_reset(i8086 *cpu);
+int  i8086_intrq(i8086 *cpu, uint nmi, uint irq);
+void i8086_tick( i8086 *cpu);
+
+uint i8086_reg_get(i8086 *cpu, uint reg);
+void i8086_reg_set(i8086 *cpu, uint reg, uint value);
+
+
+static inline struct wire i8086_mkirq(i8086 *cpu) {
+	return wire_make((wire_fn*)&i8086_intrq, cpu, 0);
 }
 
 
-static inline struct wire i8086_nmi(struct i8086 *cpu) {
-	struct wire w = {
-		.fn=(wire_fn*)&i8086_intrq, .data=cpu, .id=1
-	};
-	return w;
+static inline struct wire i8086_mknmi(i8086 *cpu) {
+	return wire_make((wire_fn*)&i8086_intrq, cpu, 1);
 }
 
 
