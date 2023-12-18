@@ -13,6 +13,7 @@
 #include "core/types.h"
 #include "core/debug.h"
 #include "core/io.h"
+#include "core/memory.h"
 #include "core/wire.h"
 
 #include "cpu/i8086.h"
@@ -20,7 +21,7 @@
 
 
 
-void i8086_dump(struct i8086 *cpu)
+void i8086_dump(i8086 *cpu)
 {
 
 	printf( "\n\n"
@@ -30,8 +31,10 @@ void i8086_dump(struct i8086 *cpu)
 
 		cpu->regs.ax.w, cpu->regs.bx.w, cpu->regs.cx.w, cpu->regs.dx.w,
 		cpu->regs.sp.w, cpu->regs.bp.w, cpu->regs.si.w, cpu->regs.di.w,
-		cpu->regs.ds,   cpu->regs.es,   cpu->regs.ss,
-		cpu->regs.cs,   cpu->regs.ip,
+
+		i8086_reg_get(cpu, REG_DS), i8086_reg_get(cpu, REG_ES),
+		i8086_reg_get(cpu, REG_SS), i8086_reg_get(cpu, REG_CS),
+		cpu->regs.ip,
 
 		cpu->flags.v? "OV": "NV",
 		cpu->flags.d? "DN": "UP",
@@ -50,7 +53,7 @@ void i8086_dump(struct i8086 *cpu)
 	u32 addr = cpu->regs.scs * 16 + cpu->regs.sip;
 
 	for (int n=0; n < 16; n++)
-		buf[n] = cpu->memory_base[(addr + n) & cpu->memory_mask];
+		buf[n] = cpu->memory.mem.base[(addr + n) & cpu->memory.mem.mask];
 
 	ZydisDisassembledInstruction insn;
 
@@ -71,19 +74,21 @@ void i8086_stack(struct i8086 *cpu)
 
 	char buf[32];
 
+	const u16 ss = i8086_reg_get(cpu, REG_SS);
+
 	for (int n=8; n >= -8; n--) {
 
-		u16  sp    = cpu->regs.sp.w + n * 2;
-		uint addr  = cpu->regs.ss * 16 +  sp;
-		uint value = *(u16*)(cpu->memory_base + ((addr + n) & cpu->memory_mask));
+		const u16  sp    = cpu->regs.sp.w + n * 2;
+		const uint stack = (ss * 16 + sp) & cpu->memory.mem.mask;
+		const uint value = *(u16*)&cpu->memory.mem.base[stack];
 
-		if (cpu->regs.ss * 16 + cpu->regs.ss == addr)
+		if (sp == cpu->regs.bp.w)
 			strcpy(buf, "BP +  0");
 
 		else if (n < 0) sprintf(buf, "SP - %2d", -n * 2);
 		else            sprintf(buf, "SP + %2d",  n * 2);
 
-		printf("%04x:%04x: %05x    [%07s]    %04x\n", cpu->regs.ss, sp, addr, buf, value);
+		printf("%04x:%04x: %05x    [%07s]    %04x\n", ss, sp, stack, buf, value);
 
 	}
 
