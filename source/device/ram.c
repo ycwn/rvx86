@@ -7,7 +7,8 @@
 
 #include "core/types.h"
 #include "core/debug.h"
-#include "core/bus.h"
+#include "core/io.h"
+#include "core/memory.h"
 
 #include "device/ram.h"
 
@@ -15,105 +16,60 @@
 
 
 
-void ram_alloc(struct ram *ram, size_t size)
+void ram_alloc(RAM *ram, u32 length)
 {
 
-	ram->memory = malloc(size);
-	ram->size   = size;
+	ram->base   = malloc(length);
+	ram->length = length;
+	ram->limit  = ram->base + length;
+	ram->mask   = length - 1;
 
 }
 
 
 
-void ram_free(struct ram *ram)
+void ram_free(RAM *ram)
 {
 
-	free(ram->memory);
-
-	ram->memory = NULL;
-	ram->size   = 0;
+	free(ram->base);
+	memory_init(ram);
 
 }
 
 
 
-int ram_rd(struct ram *ram, u32 addr, uint mode, uint *value)
+void ram_load(RAM *ram, u32 addr, u32 len, const char *path)
 {
 
-	uint v = 0;
-
-	if (addr < ram->size)
-		v = ram->memory[addr];
-
-	if (BUS_IS_RD16(mode)) {
-
-		addr++;
-
-		if (addr < ram->size)
-			v |= ram->memory[addr] << 8;
-
-	}
-
-	*value = v;
-	return 0;
+	fs_load(path, "RAM image", ram->base + addr, (len < ram->length - addr)? len: ram->length - addr, 1);
 
 }
 
 
 
-int ram_wr(struct ram *ram, u32 addr, uint mode, uint *value)
+void ram_save(RAM *ram, u32 addr, u32 len, const char *path)
 {
 
-	if (addr < ram->size)
-		ram->memory[addr] = *value >> 0;
-
-	if (BUS_IS_WR16(mode)) {
-
-		addr++;
-
-		if (addr < ram->size)
-			ram->memory[addr] = *value >> 8;
-
-	}
-
-	return 0;
+	fs_save(path, "RAM image", ram->base + addr, (len < ram->length - addr)? len: ram->length - addr, 1);
 
 }
 
 
 
-void ram_load(struct ram *ram, u32 addr, size_t len, const char *path)
+u8 ram_peek(RAM *ram, u32 addr)
 {
 
-	fs_load(path, "RAM image", ram->memory + addr, (len < ram->size - addr)? len: ram->size - addr, 1);
+	return (addr < ram->length)? ram->base[addr]: 0x00;
 
 }
 
 
 
-void ram_save(struct ram *ram, u32 addr, size_t len, const char *path)
+void ram_poke(RAM *ram, u32 addr, const u8 value)
 {
 
-	fs_save(path, "RAM image", ram->memory + addr, (len < ram->size - addr)? len: ram->size - addr, 1);
-
-}
-
-
-
-u8 ram_peek(struct ram *ram, u32 addr)
-{
-
-	return (addr < ram->size)? ram->memory[addr]: 0x00;
-
-}
-
-
-
-void ram_poke(struct ram *ram, u32 addr, const u8 value)
-{
-
-	if (addr < ram->size)
-		ram->memory[addr] = value;
+	if (addr < ram->length)
+		ram->base[addr] = value;
 
 }
 

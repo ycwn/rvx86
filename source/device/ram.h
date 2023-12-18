@@ -4,24 +4,16 @@
 #define DEVICE_RAM_H
 
 
-struct ram {
-
-	u8     *memory;
-	size_t  size;
-
-};
+typedef struct memory RAM;
 
 
-void ram_alloc(struct ram *ram, size_t size);
-void ram_free( struct ram *ram);
+void ram_alloc(RAM *ram, u32 length);
+void ram_free( RAM *ram);
 
-int ram_rd(struct ram *ram, u32 addr, uint mode, uint *value);
-int ram_wr(struct ram *ram, u32 addr, uint mode, uint *value);
-
-void ram_load(struct ram *ram, u32 addr, size_t len, const char *path);
-void ram_save(struct ram *ram, u32 addr, size_t len, const char *path);
-u8   ram_peek(struct ram *ram, u32 addr);
-void ram_poke(struct ram *ram, u32 addr, u8 value);
+void ram_load(RAM *ram, u32 addr, u32 length, const char *path);
+void ram_save(RAM *ram, u32 addr, u32 length, const char *path);
+u8   ram_peek(RAM *ram, u32 addr);
+void ram_poke(RAM *ram, u32 addr, u8 value);
 
 
 #endif
